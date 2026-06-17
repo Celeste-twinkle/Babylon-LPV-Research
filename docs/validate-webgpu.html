@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="Validate IrradianceVolume probe sampling on dynamic objects in Sponza with WebGPU."
+    />
+    <title>IrradianceVolume Validate WebGPU</title>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/style-CVgRVYuf.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/observable.pure-WBWqA1Qn.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/engineStore-C7OguShv.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/domManagement-BqltO0ki.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/logger-CuBYPcDK.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/webRequest-CNElM_Yd.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/tools.functions-BRF-Ptxj.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/preload-helper-BGudr8Iy.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/performanceConfigurator-UtxC_Odd.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/shaderStore-D-XQlhUT.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/internalTexture-CgoYOlZG.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/precisionDate-Uyb-ubD0.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/thinEngine.pure-D7nRsJLR.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/buffer.pure-CNnuMtRn.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/keyboardEvents-CGYiptFb.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/math.scalar.functions-lnL7TJ7T.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/typeStore-Cu_sj2zM.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/math.vector.pure-D3Yk2YK3.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/pointerEvents-CmonzwzK.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/guid-BXdVC_j_.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/tools.pure-rzFtW1dN.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/lightConstants-L3VDms3v.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/sceneComponent-DgoN-pbU.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/math.color.pure-_GxBM3om.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/math.plane-y1mRQWqi.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/decorators-BOtej2xA.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/math.size-CvFwYfiX.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/renderingManager-CbVC4AoW.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/scene.pure-CH30-MhA.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/animation.pure-LuZVvY4u.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/texture.pure-BTPaNx8I.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/constants-FfqMFcYa.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/math.color-BSJGaPKM.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/glTFLoaderAnimation-DQJ_Fs4w.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/easing-hxppYHEf.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/webAudioBaseSubGraph-BR19wLWL.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/spatialWebAudio-D5nqhe5Z.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/abstractSoundSource-DVnkH855.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/abstractSoundInstance-CZ-onmKd.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/webAudioStaticSound-7LUqebkG.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/webAudioStreamingSound-BrfVObSz.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/webAudioSoundSource-DaAcVEEC.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/bone.pure-DAGt9xHE.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/material.pure-ChDWsiRI.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/flowGraphBlock-Da6genOn.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/flowGraphAssetsContext-WtUyuDAI.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/flowGraphExecutionBlock-CZXPtsmm.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/flowGraphExecutionBlockWithOutSignal-yRe-xru_.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/flowGraphAsyncExecutionBlock-BqcgryHS.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/flowGraphEventBlock-CUDFOy5G.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/utils-N5rsUTjt.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/flowGraphCoordinator-DACFbpGi.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/flowGraphRichTypes-Dh-TEcSh.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/textureLoaderManager-CnSLiLv1.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/renderTargetTexture.pure-yBF9IFGU.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/openpbrMaterialLoadingAdapter-SBg9p9-M.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/imageProcessing-BDpUICqF.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/effectRenderer.pure-CS6MCYoh.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/material.detailMapConfiguration-P84SL1VO.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/sphericalPolynomial.pure-CdjXD7Bu.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/textureTools-BS2Xqxzy.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/environmentTextureTools.pure-CvLfhbmZ.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/workerPool-aLlzPuNn.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/flowGraphGLTFDataProvider-TYTYUjKO.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/pbrMaterialLoadingAdapter-D_TFU_kP.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/sponzaScene-bJ_EwyGQ.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/rgbdTextureTools-BU96qngV.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/brdfTextureTools-Bc2J8Xxx.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/pbrBaseMaterial.pure-DsUZKEaB.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/cubemapToSphericalPolynomial-2niyyUGT.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/baseTexture.polynomial.pure-CyIKFXhK.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/irradianceVolumePbrPlugin-BCRgMpT3.js"></script>
+    <script type="module" crossorigin src="/Babylon-LPV-Research/assets/validate-BLMlWhTs.js"></script>
+    <link rel="stylesheet" crossorigin href="/Babylon-LPV-Research/assets/style-DcjALrC7.css">
+  </head>
+  <body>
+    <div id="app"></div>
+  </body>
+</html>

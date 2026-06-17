@@ -7,6 +7,7 @@
     "dev": "vite",
     "typecheck": "tsc",
     "build": "tsc && vite build",
+    "build:docs": "tsc && vite build --base /Babylon-LPV-Research/ --outDir docs",
     "preview": "vite preview"
   },
   "devDependencies": {
