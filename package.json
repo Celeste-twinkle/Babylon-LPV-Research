@@ -1,0 +1,22 @@
+{
+  "name": "babylon-lpv-research",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "typescript": "~6.0.2",
+    "vite": "^8.0.12"
+  },
+  "dependencies": {
+    "@babylonjs/core": "^9.12.1",
+    "@babylonjs/loaders": "^9.12.1",
+    "@tweakpane/core": "^2.0.5",
+    "tweakpane": "^4.0.5"
+  }
+}
