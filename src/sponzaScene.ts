@@ -41,8 +41,14 @@ export const createSponzaApp = async (
   canvas: HTMLCanvasElement,
   onStatus: (message: string, isError?: boolean) => void,
   preferWebGPU = false,
+  requireWebGPU = false,
 ): Promise<SponzaApp> => {
-  const usingWebGPU = preferWebGPU && 'gpu' in navigator
+  const hasWebGPU = 'gpu' in navigator
+  if (requireWebGPU && !hasWebGPU) {
+    throw new Error('This baker requires WebGPU. Use a browser and GPU driver with WebGPU enabled.')
+  }
+
+  const usingWebGPU = preferWebGPU && hasWebGPU
   const engine = usingWebGPU
     ? await WebGPUEngine.CreateAsync(canvas, {
       stencil: true,

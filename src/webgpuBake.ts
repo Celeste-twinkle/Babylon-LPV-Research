@@ -31,7 +31,7 @@ export type WebGPUBakeInput = {
   bounces: number
   areaSamples?: number
   bounceRayCount?: number
-  batchSize?: number
+  accumulationSamples?: number
   onProgress?: (percent: number, message: string) => void
 }
 
@@ -46,9 +46,13 @@ const LIGHT_STRIDE_FLOATS = 16
 const TRIANGLE_STRIDE_FLOATS = 16
 const BVH_NODE_STRIDE_FLOATS = 12
 const BVH_LEAF_SIZE = 8
-const DEFAULT_BATCH_SIZE = 512
-const READBACK_CHUNK_BYTES = 1024 * 1024
+const MAX_DISPATCH_PROBE_SLICE_SIZE = 32
+const MAX_DISPATCH_RAY_WORK_ESTIMATE = 8192
+const PROBE_VISIBILITY_RAY_COUNT_ESTIMATE = 8
+const PROBE_RELOCATION_RAY_COUNT_ESTIMATE = 12
+const READBACK_CHUNK_BYTES = 16 * 1024 * 1024
 const SHADER_READY_TIMEOUT_MS = 8000
+const SUBMITTED_WORK_TIMEOUT_MS = 45000
 const READBACK_TIMEOUT_MS = 600000
 const GPU_BUFFER_USAGE_MAP_READ = 0x0001
 const GPU_BUFFER_USAGE_COPY_DST = 0x0008
@@ -67,8 +71,10 @@ export const bakeIrradianceVolumeWebGPU = async (
 
   const engine = input.engine as WebGPUEngine
   const probeCount = input.resolution[0] * input.resolution[1] * input.resolution[2]
-  const batchSize = clampBatchSize(input.batchSize, probeCount)
-  const batchCount = Math.ceil(probeCount / batchSize)
+  const rayWorkEstimate = estimateRayWorkPerProbe(input)
+  const dispatchSliceSize = chooseDispatchProbeSliceSize(probeCount, rayWorkEstimate)
+  const dispatchSliceCount = Math.ceil(probeCount / dispatchSliceSize)
+  const accumulationSamples = clampInteger(input.accumulationSamples ?? 1, 1, 64)
   const payloadBytes = probeCount * IVOL_PROBE_STRIDE_FLOATS * Float32Array.BYTES_PER_ELEMENT
   const params = createParams(input)
   const lightData = createLightBuffer(input.lights)
@@ -149,40 +155,61 @@ export const bakeIrradianceVolumeWebGPU = async (
     report(24, 'Waiting for compute shader raytracing pipeline.')
     await waitForComputeShaderReady(shader, () => compileError, SHADER_READY_TIMEOUT_MS)
 
-    report(32, `Baking ${probeCount} probes in ${batchCount} GPU batch(es).`)
-    for (let batchIndex = 0; batchIndex < batchCount; batchIndex += 1) {
-      const batchOffset = batchIndex * batchSize
-      const currentBatchSize = Math.min(batchSize, probeCount - batchOffset)
-      const progressStart = 32 + (batchIndex / batchCount) * 54
+    report(
+      32,
+      `Baking ${probeCount} probes with ${accumulationSamples} accumulation sample(s) across ${dispatchSliceCount} internal dispatch slice(s) of up to ${dispatchSliceSize} probes.`,
+    )
+    for (let sampleIndex = 0; sampleIndex < accumulationSamples; sampleIndex += 1) {
+      for (let sliceIndex = 0; sliceIndex < dispatchSliceCount; sliceIndex += 1) {
+        const sliceOffset = sliceIndex * dispatchSliceSize
+        const currentSliceSize = Math.min(dispatchSliceSize, probeCount - sliceOffset)
+        const completedUnits = sampleIndex * dispatchSliceCount + sliceIndex
+        const totalUnits = accumulationSamples * dispatchSliceCount
+        const progressStart = 32 + (completedUnits / totalUnits) * 54
 
-      params[17] = batchOffset
-      params[18] = currentBatchSize
-      paramsBuffer.update(params)
+        params[17] = sliceOffset
+        params[18] = currentSliceSize
+        params[21] = sampleIndex
+        params[22] = accumulationSamples
+        paramsBuffer.update(params)
 
-      report(
-        progressStart,
-        `Queued GPU batch ${batchIndex + 1} / ${batchCount}: probes ${batchOffset + 1}-${batchOffset + currentBatchSize}.`,
-      )
-      if (!shader.dispatch(Math.ceil(currentBatchSize / 64))) {
-        throw new Error(`WebGPU compute dispatch returned false for batch ${batchIndex + 1}.`)
+        report(
+          progressStart,
+          `Queued accumulation sample ${sampleIndex + 1} / ${accumulationSamples}, dispatch slice ${sliceIndex + 1} / ${dispatchSliceCount}: probes ${sliceOffset + 1}-${sliceOffset + currentSliceSize}.`,
+        )
+        const popGpuErrorScope = pushGpuErrorScope(engine)
+        if (!shader.dispatch(Math.ceil(currentSliceSize / 64))) {
+          throw new Error(`WebGPU compute dispatch returned false for sample ${sampleIndex + 1}, dispatch slice ${sliceIndex + 1}.`)
+        }
+        await waitForSubmittedGpuWork(
+          engine,
+          SUBMITTED_WORK_TIMEOUT_MS,
+          `accumulation sample ${sampleIndex + 1} / ${accumulationSamples}, dispatch slice ${sliceIndex + 1} / ${dispatchSliceCount}`,
+        )
+        await popGpuErrorScope(`accumulation sample ${sampleIndex + 1}, dispatch slice ${sliceIndex + 1}`)
+
+        report(
+          32 + ((completedUnits + 1) / totalUnits) * 54,
+          `Completed accumulation sample ${sampleIndex + 1} / ${accumulationSamples}, dispatch slice ${sliceIndex + 1} / ${dispatchSliceCount}.`,
+        )
+        await sleep(0)
       }
-      await waitForSubmittedGpuWork(engine)
-
-      report(
-        32 + ((batchIndex + 1) / batchCount) * 54,
-        `Completed GPU batch ${batchIndex + 1} / ${batchCount}.`,
-      )
-      await sleep(0)
     }
 
     report(88, 'Preparing chunked GPU readback.')
-    const payload = await withTimeout(
+    let payload = await withTimeout(
       readStorageBufferInChunks(engine, outputBuffer, payloadBytes, report),
       READBACK_TIMEOUT_MS,
       'Timed out while reading the WebGPU irradiance payload.',
     )
 
-    report(94, 'Packing binary .ivol payload.')
+    report(93, 'Denoising SH payload with visibility-aware neighbor filtering.')
+    payload = denoiseIvolPayload(input.resolution, payload)
+
+    report(94, 'Constraining SH coefficients and dominant light energy.')
+    payload = constrainIvolPayloadSh(payload)
+
+    report(95, 'Packing binary .ivol payload.')
     const binary = createIvolBinary(input, payload)
 
     return {
@@ -275,16 +302,67 @@ type FlushableWebGPUEngine = WebGPUEngine & {
   _device?: GPUDevice
 }
 
-const waitForSubmittedGpuWork = async (engine: WebGPUEngine): Promise<void> => {
+const waitForSubmittedGpuWork = async (
+  engine: WebGPUEngine,
+  timeoutMs: number,
+  context: string,
+): Promise<void> => {
   const flushable = engine as FlushableWebGPUEngine
 
   flushable.flushFramebuffer?.(false)
 
+  const device = flushable._device
   const queue = flushable._device?.queue
-  if (typeof queue?.onSubmittedWorkDone === 'function') {
-    await queue.onSubmittedWorkDone()
-  } else {
-    await sleep(0)
+  const submittedWork = typeof queue?.onSubmittedWorkDone === 'function'
+    ? queue.onSubmittedWorkDone()
+    : sleep(0)
+
+  if (!device) {
+    await submittedWork
+
+    return
+  }
+
+  await Promise.race([
+    submittedWork,
+    rejectOnDeviceLost(device, context),
+    rejectAfterTimeout(timeoutMs, `Timed out while waiting for WebGPU work to finish (${context}).`),
+  ])
+}
+
+const rejectAfterTimeout = async (timeoutMs: number, message: string): Promise<never> =>
+  new Promise((_resolve, reject) => {
+    window.setTimeout(() => {
+      reject(new Error(`${message} (${timeoutMs}ms)`))
+    }, timeoutMs)
+  })
+
+const rejectOnDeviceLost = async (device: GPUDevice, context: string): Promise<never> => {
+  const info = await device.lost
+  const reason = info.reason ? ` Reason: ${info.reason}.` : ''
+  const message = info.message ? ` ${info.message}` : ''
+
+  throw new Error(`WebGPU device was lost while baking ${context}.${reason}${message}`)
+}
+
+const pushGpuErrorScope = (engine: WebGPUEngine): ((context: string) => Promise<void>) => {
+  const device = (engine as FlushableWebGPUEngine)._device
+
+  if (!device) {
+    return async () => {}
+  }
+
+  device.pushErrorScope('validation')
+  device.pushErrorScope('out-of-memory')
+
+  return async (context: string): Promise<void> => {
+    const outOfMemoryError = await device.popErrorScope()
+    const validationError = await device.popErrorScope()
+    const error = outOfMemoryError ?? validationError
+
+    if (error) {
+      throw new Error(`WebGPU error during ${context}: ${error.message}`)
+    }
   }
 }
 
@@ -390,14 +468,217 @@ const waitWithReadbackPulse = async <T>(
   }
 }
 
-const clampBatchSize = (value: number | undefined, probeCount: number): number => {
-  const requested = Number.isFinite(value) ? Math.floor(value as number) : DEFAULT_BATCH_SIZE
+const chooseDispatchProbeSliceSize = (probeCount: number, rayWorkEstimate: number): number => {
+  const safeProbeCount = Math.max(1, probeCount)
+  const safeWorkEstimate = Math.max(1, rayWorkEstimate)
+  const maxByWork = Math.max(1, Math.floor(MAX_DISPATCH_RAY_WORK_ESTIMATE / safeWorkEstimate))
 
-  return Math.max(1, Math.min(probeCount, Math.max(64, requested)))
+  return Math.max(1, Math.min(safeProbeCount, MAX_DISPATCH_PROBE_SLICE_SIZE, maxByWork))
+}
+
+const estimateRayWorkPerProbe = (input: WebGPUBakeInput): number => {
+  const lightCount = Math.max(1, Math.min(MAX_LIGHTS, input.lights.length))
+  const bounces = clampInteger(input.bounces, 0, 16)
+  const areaSamples = clampInteger(input.areaSamples ?? 4, 1, 8)
+  const bounceRayCount = clampInteger(input.bounceRayCount ?? 4, 1, 8)
+  const directLightTraces = lightCount * areaSamples
+  const surfaceLightTraces = lightCount * areaSamples
+  const bounceTraces = bounceRayCount * bounces * (1 + surfaceLightTraces)
+  const relocationAndVisibilityTraces =
+    PROBE_RELOCATION_RAY_COUNT_ESTIMATE + PROBE_VISIBILITY_RAY_COUNT_ESTIMATE * 2
+
+  return relocationAndVisibilityTraces + directLightTraces + bounceTraces
 }
 
 const clampInteger = (value: number, min: number, max: number): number =>
   Math.min(max, Math.max(min, Math.round(value)))
+
+const denoiseIvolPayload = (resolution: Vec3Tuple, payload: Float32Array): Float32Array => {
+  const output = new Float32Array(payload)
+  const [rx, ry, rz] = resolution
+  const neighborOffsets: Vec3Tuple[] = [
+    [-1, 0, 0],
+    [1, 0, 0],
+    [0, -1, 0],
+    [0, 1, 0],
+    [0, 0, -1],
+    [0, 0, 1],
+  ]
+
+  for (let z = 0; z < rz; z += 1) {
+    for (let y = 0; y < ry; y += 1) {
+      for (let x = 0; x < rx; x += 1) {
+        const index = getPayloadProbeIndex(x, y, z, resolution)
+        const base = index * IVOL_PROBE_STRIDE_FLOATS
+        const centerVisibility = payload[base + 28]
+        const centerProximity = payload[base + 29]
+        const centerRelocation = payload[base + 33]
+        const sums = new Float32Array(28)
+        let weightSum = 1
+
+        for (let channel = 0; channel < sums.length; channel += 1) {
+          sums[channel] = payload[base + channel]
+        }
+
+        for (const [dx, dy, dz] of neighborOffsets) {
+          const nx = x + dx
+          const ny = y + dy
+          const nz = z + dz
+
+          if (nx < 0 || ny < 0 || nz < 0 || nx >= rx || ny >= ry || nz >= rz) {
+            continue
+          }
+
+          const neighborBase = getPayloadProbeIndex(nx, ny, nz, resolution) * IVOL_PROBE_STRIDE_FLOATS
+          const visibilityDelta = Math.abs(centerVisibility - payload[neighborBase + 28])
+          const proximityDelta = Math.abs(centerProximity - payload[neighborBase + 29])
+          const relocationDelta = Math.abs(centerRelocation - payload[neighborBase + 33])
+          const edgeWeight = Math.max(0, 1 - visibilityDelta * 1.8 - proximityDelta * 1.4 - relocationDelta * 0.9)
+          const neighborTrust = Math.max(0.08, payload[neighborBase + 28] * payload[neighborBase + 29])
+          const weight = 0.28 * edgeWeight * neighborTrust
+
+          if (weight <= 0.0001) {
+            continue
+          }
+
+          for (let channel = 0; channel < sums.length; channel += 1) {
+            sums[channel] += payload[neighborBase + channel] * weight
+          }
+          weightSum += weight
+        }
+
+        for (let channel = 0; channel < sums.length; channel += 1) {
+          output[base + channel] = sums[channel] / weightSum
+        }
+      }
+    }
+  }
+
+  return output
+}
+
+const constrainIvolPayloadSh = (payload: Float32Array): Float32Array => {
+  const output = new Float32Array(payload)
+  const probeCount = Math.floor(payload.length / IVOL_PROBE_STRIDE_FLOATS)
+  const sampleDirections: Vec3Tuple[] = [
+    [1, 0, 0],
+    [-1, 0, 0],
+    [0, 1, 0],
+    [0, -1, 0],
+    [0, 0, 1],
+    [0, 0, -1],
+  ]
+
+  for (let probeIndex = 0; probeIndex < probeCount; probeIndex += 1) {
+    const base = probeIndex * IVOL_PROBE_STRIDE_FLOATS
+
+    for (let channel = 0; channel < 3; channel += 1) {
+      const l0 = sanitizePositive(payload[base + channel])
+      output[base + channel] = l0
+
+      const l1Limit = l0 * 1.18 + 0.0001
+      const l2Limit = l0 * 0.72 + 0.0001
+
+      for (let coefficient = 1; coefficient <= 3; coefficient += 1) {
+        const offset = base + coefficient * 3 + channel
+        output[offset] = clampFinite(payload[offset], -l1Limit, l1Limit)
+      }
+
+      for (let coefficient = 4; coefficient <= 8; coefficient += 1) {
+        const offset = base + coefficient * 3 + channel
+        output[offset] = clampFinite(payload[offset], -l2Limit, l2Limit)
+      }
+    }
+
+    let worstScale = 1
+    for (const direction of sampleDirections) {
+      const irradiance = evaluatePackedShDirection(output, base, direction)
+      const ambientFloor = [
+        output[base] * 0.025,
+        output[base + 1] * 0.025,
+        output[base + 2] * 0.025,
+      ]
+
+      for (let channel = 0; channel < 3; channel += 1) {
+        if (irradiance[channel] < ambientFloor[channel]) {
+          const dynamic = irradiance[channel] - output[base + channel] * 0.42
+          if (dynamic < -0.0001) {
+            const allowed = ambientFloor[channel] - output[base + channel] * 0.42
+            worstScale = Math.min(worstScale, clamp01(allowed / dynamic))
+          }
+        }
+      }
+    }
+
+    if (worstScale < 0.999) {
+      for (let coefficient = 1; coefficient <= 8; coefficient += 1) {
+        const offset = base + coefficient * 3
+        output[offset] *= worstScale
+        output[offset + 1] *= worstScale
+        output[offset + 2] *= worstScale
+      }
+    }
+
+    const ambientEnergy = luminance(output[base], output[base + 1], output[base + 2])
+    output[base + 27] = clampFinite(payload[base + 27], 0, Math.max(0.0001, ambientEnergy * 4.5))
+    output[base + 28] = clamp01Finite(payload[base + 28], 1)
+    output[base + 29] = clamp01Finite(payload[base + 29], 1)
+    output[base + 33] = clamp01Finite(payload[base + 33], 0)
+    output[base + 34] = clamp01Finite(payload[base + 34], 1)
+    output[base + 35] = clamp01Finite(payload[base + 35], 1)
+  }
+
+  return output
+}
+
+const evaluatePackedShDirection = (payload: Float32Array, base: number, direction: Vec3Tuple): Vec3Tuple => {
+  const [x, y, z] = direction
+  const result: Vec3Tuple = [0, 0, 0]
+
+  for (let channel = 0; channel < 3; channel += 1) {
+    const sh0 = payload[base + channel]
+    const sh1 = payload[base + 3 + channel]
+    const sh2 = payload[base + 6 + channel]
+    const sh3 = payload[base + 9 + channel]
+    const sh4 = payload[base + 12 + channel]
+    const sh5 = payload[base + 15 + channel]
+    const sh6 = payload[base + 18 + channel]
+    const sh7 = payload[base + 21 + channel]
+    const sh8 = payload[base + 24 + channel]
+    const l1 = sh1 * x + sh2 * y + sh3 * z
+    const l2 =
+      sh4 * (x * y) +
+      sh5 * (y * z) +
+      sh6 * (3 * z * z - 1) +
+      sh7 * (x * z) +
+      sh8 * (x * x - y * y)
+
+    result[channel] = sh0 * 0.42 + l1 * 0.72 + l2 * 0.32
+  }
+
+  return result
+}
+
+const sanitizePositive = (value: number): number =>
+  Number.isFinite(value) ? Math.max(0, value) : 0
+
+const clampFinite = (value: number, min: number, max: number): number =>
+  Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : min
+
+const clamp01Finite = (value: number, fallback: number): number =>
+  Number.isFinite(value) ? clamp01(value) : fallback
+
+const luminance = (r: number, g: number, b: number): number =>
+  r * 0.2126 + g * 0.7152 + b * 0.0722
+
+const clamp01 = (value: number): number => Math.min(1, Math.max(0, value))
+
+const getPayloadProbeIndex = (
+  x: number,
+  y: number,
+  z: number,
+  resolution: Vec3Tuple,
+): number => x + y * resolution[0] + z * resolution[0] * resolution[1]
 
 const createParams = (input: WebGPUBakeInput): Float32Array => {
   const params = new Float32Array(32)
@@ -417,6 +698,8 @@ const createParams = (input: WebGPUBakeInput): Float32Array => {
   params[18] = input.resolution[0] * input.resolution[1] * input.resolution[2]
   params[19] = clampInteger(input.areaSamples ?? 4, 1, 8)
   params[20] = clampInteger(input.bounceRayCount ?? 4, 1, 8)
+  params[21] = 0
+  params[22] = clampInteger(input.accumulationSamples ?? 1, 1, 64)
 
   return params
 }
@@ -737,12 +1020,14 @@ const WEBGPU_BAKE_SHADER = /* wgsl */ `
 @group(0) @binding(4) var<storage, read> bvhNodes : array<f32>;
 
 const LIGHT_STRIDE : u32 = 16u;
-const PROBE_STRIDE : u32 = 16u;
+const PROBE_STRIDE : u32 = 36u;
 const TRIANGLE_STRIDE : u32 = 16u;
 const BVH_NODE_STRIDE : u32 = 12u;
-const BVH_STACK_SIZE : u32 = 64u;
+const BVH_STACK_SIZE : u32 = 256u;
 const MAX_BOUNCE_RAY_COUNT : u32 = 8u;
 const MAX_AREA_LIGHT_SAMPLE_COUNT : u32 = 8u;
+const PROBE_VISIBILITY_RAY_COUNT : u32 = 8u;
+const PROBE_RELOCATION_RAY_COUNT : u32 = 12u;
 const PI : f32 = 3.14159265359;
 const GOLDEN_ANGLE : f32 = 2.39996322973;
 const SHADOW_EPSILON : f32 = 0.006;
@@ -761,6 +1046,12 @@ struct LightContribution {
   irradiance: vec3<f32>,
   dominantIntensity: f32,
   directionToLight: vec3<f32>,
+};
+
+struct RelocatedProbe {
+  position: vec3<f32>,
+  offset: vec3<f32>,
+  strength: f32,
 };
 
 fn saturate(value: f32) -> f32 {
@@ -917,7 +1208,7 @@ fn traceRay(origin: vec3<f32>, direction: vec3<f32>, minT: f32, maxDistance: f32
   }
 
   var closest = missHit(maxDistance);
-  var stack: array<u32, 64>;
+  var stack: array<u32, 256>;
   var stackSize = 1u;
   stack[0] = 0u;
 
@@ -953,11 +1244,17 @@ fn traceRay(origin: vec3<f32>, direction: vec3<f32>, minT: f32, maxDistance: f32
     } else {
       let left = i32(bvhNodes[nodeBase + 3u]);
       let right = i32(bvhNodes[nodeBase + 7u]);
-      if (left >= 0 && stackSize < BVH_STACK_SIZE) {
+      if (left >= 0) {
+        if (stackSize >= BVH_STACK_SIZE) {
+          return TriangleHit(true, false, minT, vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0));
+        }
         stack[stackSize] = u32(left);
         stackSize = stackSize + 1u;
       }
-      if (right >= 0 && stackSize < BVH_STACK_SIZE) {
+      if (right >= 0) {
+        if (stackSize >= BVH_STACK_SIZE) {
+          return TriangleHit(true, false, minT, vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0));
+        }
         stack[stackSize] = u32(right);
         stackSize = stackSize + 1u;
       }
@@ -1012,7 +1309,7 @@ fn areaLightSamplePosition(center: vec3<f32>, sourceRadius: f32, sampleIndex: u3
   return center + offset;
 }
 
-fn lightContribution(lightIndex: u32, position: vec3<f32>) -> LightContribution {
+fn lightContribution(lightIndex: u32, position: vec3<f32>, sampleSeed: u32) -> LightContribution {
   let base = lightIndex * LIGHT_STRIDE;
   let lightType = u32(lights[base]);
   let intensity = lights[base + 1u];
@@ -1046,7 +1343,7 @@ fn lightContribution(lightIndex: u32, position: vec3<f32>) -> LightContribution 
         break;
       }
 
-      let samplePosition = areaLightSamplePosition(vector, sourceRadius, sample, sampleCount, lightIndex);
+      let samplePosition = areaLightSamplePosition(vector, sourceRadius, sample, sampleCount, lightIndex + sampleSeed * 131u);
       let delta = samplePosition - position;
       let distanceSquared = max(dot(delta, delta), 0.08);
       let distance = sqrt(distanceSquared);
@@ -1080,7 +1377,7 @@ fn directionToLight(delta: vec3<f32>) -> vec3<f32> {
   return safeNormalize(delta, vec3<f32>(0.0, 1.0, 0.0));
 }
 
-fn surfaceLightContribution(lightIndex: u32, position: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+fn surfaceLightContribution(lightIndex: u32, position: vec3<f32>, normal: vec3<f32>, sampleSeed: u32) -> vec3<f32> {
   let base = lightIndex * LIGHT_STRIDE;
   let lightType = u32(lights[base]);
   let intensity = lights[base + 1u];
@@ -1103,7 +1400,7 @@ fn surfaceLightContribution(lightIndex: u32, position: vec3<f32>, normal: vec3<f
         break;
       }
 
-      let samplePosition = areaLightSamplePosition(vector, sourceRadius, sample, sampleCount, lightIndex);
+      let samplePosition = areaLightSamplePosition(vector, sourceRadius, sample, sampleCount, lightIndex + sampleSeed * 173u);
       let delta = samplePosition - position;
       let distanceSquared = max(dot(delta, delta), 0.08);
       let distance = sqrt(distanceSquared);
@@ -1138,13 +1435,64 @@ fn surfaceLightContribution(lightIndex: u32, position: vec3<f32>, normal: vec3<f
   return vec3<f32>(0.0);
 }
 
-fn surfaceLighting(position: vec3<f32>, normal: vec3<f32>, lightCount: u32) -> vec3<f32> {
+fn surfaceLighting(position: vec3<f32>, normal: vec3<f32>, lightCount: u32, sampleSeed: u32) -> vec3<f32> {
   var irradiance = vec3<f32>(0.0);
   for (var i = 0u; i < lightCount; i = i + 1u) {
-    irradiance = irradiance + surfaceLightContribution(i, position, normal);
+    irradiance = irradiance + surfaceLightContribution(i, position, normal, sampleSeed);
   }
 
   return irradiance;
+}
+
+fn shBasis4(direction: vec3<f32>) -> vec4<f32> {
+  return vec4<f32>(
+    1.0,
+    direction.x,
+    direction.y,
+    direction.z,
+  );
+}
+
+fn shBasis5(direction: vec3<f32>) -> vec4<f32> {
+  return vec4<f32>(
+    direction.x * direction.y,
+    direction.y * direction.z,
+    3.0 * direction.z * direction.z - 1.0,
+    direction.x * direction.z,
+  );
+}
+
+fn shBasis8(direction: vec3<f32>) -> f32 {
+  return direction.x * direction.x - direction.y * direction.y;
+}
+
+fn probeVisibilityRadius() -> f32 {
+  let rx = max(params[0] - 1.0, 1.0);
+  let ry = max(params[1] - 1.0, 1.0);
+  let rz = max(params[2] - 1.0, 1.0);
+  let boundsSize = vec3<f32>(
+    abs(params[8] - params[4]),
+    abs(params[9] - params[5]),
+    abs(params[10] - params[6]),
+  );
+  let cellSize = boundsSize / vec3<f32>(rx, ry, rz);
+  let largestCell = max(max(cellSize.x, cellSize.y), cellSize.z);
+
+  return clamp(largestCell * 1.65, 0.35, params[16]);
+}
+
+fn probeCellRadius() -> f32 {
+  let rx = max(params[0] - 1.0, 1.0);
+  let ry = max(params[1] - 1.0, 1.0);
+  let rz = max(params[2] - 1.0, 1.0);
+  let boundsSize = vec3<f32>(
+    abs(params[8] - params[4]),
+    abs(params[9] - params[5]),
+    abs(params[10] - params[6]),
+  );
+  let cellSize = boundsSize / vec3<f32>(rx, ry, rz);
+
+  return max(max(cellSize.x, cellSize.y), cellSize.z);
 }
 
 fn sphereDirection(sampleIndex: u32, count: u32, seed: u32) -> vec3<f32> {
@@ -1155,6 +1503,76 @@ fn sphereDirection(sampleIndex: u32, count: u32, seed: u32) -> vec3<f32> {
   let phi = GOLDEN_ANGLE * (sample + f32(seed & 1023u) * 0.037);
 
   return vec3<f32>(cos(phi) * radius, z, sin(phi) * radius);
+}
+
+fn probeLocalVisibility(position: vec3<f32>, sampleSeed: u32) -> vec2<f32> {
+  let triangleCount = u32(params[14]);
+  let radius = probeVisibilityRadius();
+  if (triangleCount == 0u || radius <= SHADOW_EPSILON * 2.0) {
+    return vec2<f32>(1.0, 1.0);
+  }
+
+  var openness = 0.0;
+  var nearestDistance = radius;
+
+  for (var sample = 0u; sample < PROBE_VISIBILITY_RAY_COUNT; sample = sample + 1u) {
+    let direction = sphereDirection(sample, PROBE_VISIBILITY_RAY_COUNT, sampleSeed + sample * 719u + 97u);
+    let hit = traceRay(position + direction * SHADOW_EPSILON, direction, SHADOW_EPSILON, radius);
+
+    if (hit.hit) {
+      nearestDistance = min(nearestDistance, hit.t);
+      openness = openness + smoothstep(radius * 0.16, radius, hit.t);
+    } else {
+      openness = openness + 1.0;
+    }
+  }
+
+  let visibility = clamp(openness / f32(PROBE_VISIBILITY_RAY_COUNT), 0.0, 1.0);
+  let normalizedNearest = clamp(nearestDistance / radius, 0.0, 1.0);
+
+  return vec2<f32>(visibility, normalizedNearest);
+}
+
+fn relocateProbePosition(position: vec3<f32>, sampleSeed: u32) -> RelocatedProbe {
+  let triangleCount = u32(params[14]);
+  let cellRadius = probeCellRadius();
+  let searchRadius = clamp(cellRadius * 0.82, 0.18, params[16]);
+  if (triangleCount == 0u || searchRadius <= SHADOW_EPSILON * 2.0) {
+    return RelocatedProbe(position, vec3<f32>(0.0), 0.0);
+  }
+
+  var pushDirection = vec3<f32>(0.0);
+  var closeHitWeight = 0.0;
+
+  for (var sample = 0u; sample < PROBE_RELOCATION_RAY_COUNT; sample = sample + 1u) {
+    let direction = sphereDirection(sample, PROBE_RELOCATION_RAY_COUNT, sampleSeed + sample * 1049u + 211u);
+    let hit = traceRay(position + direction * SHADOW_EPSILON, direction, SHADOW_EPSILON, searchRadius);
+
+    if (hit.hit) {
+      let closeness = 1.0 - clamp(hit.t / searchRadius, 0.0, 1.0);
+      let weightedCloseness = closeness * closeness;
+      pushDirection = pushDirection - direction * weightedCloseness;
+      closeHitWeight = closeHitWeight + weightedCloseness;
+    }
+  }
+
+  if (closeHitWeight <= 0.0001) {
+    return RelocatedProbe(position, vec3<f32>(0.0), 0.0);
+  }
+
+  let relocationStrength = clamp(closeHitWeight / f32(PROBE_RELOCATION_RAY_COUNT) * 2.2, 0.0, 1.0);
+  let safeDirection = safeNormalize(pushDirection, vec3<f32>(0.0, 1.0, 0.0));
+  let maxOffset = cellRadius * 0.45;
+  var offset = safeDirection * maxOffset * relocationStrength;
+  var relocated = position + offset;
+
+  let verification = probeLocalVisibility(relocated, sampleSeed + 1931u);
+  if (verification.x < 0.08 && verification.y < 0.08) {
+    offset = vec3<f32>(0.0);
+    relocated = position;
+  }
+
+  return RelocatedProbe(relocated, offset, relocationStrength);
 }
 
 fn hemisphereDirection(normal: vec3<f32>, sampleIndex: u32, bounce: u32, seed: u32, rayCount: u32) -> vec3<f32> {
@@ -1179,6 +1597,7 @@ fn traceBounceContribution(
   bounces: u32,
   sampleIndex: u32,
   rayCount: u32,
+  sampleSeed: u32,
 ) -> vec3<f32> {
   var origin = startPosition;
   var direction = firstDirection;
@@ -1196,13 +1615,13 @@ fn traceBounceContribution(
     }
 
     let hitPosition = origin + direction * hit.t;
-    let directAtSurface = surfaceLighting(hitPosition + hit.normal * SHADOW_EPSILON, hit.normal, lightCount);
+    let directAtSurface = surfaceLighting(hitPosition + hit.normal * SHADOW_EPSILON, hit.normal, lightCount, sampleSeed + bounce * 397u);
     let distanceAttenuation = 1.0 / (1.0 + hit.t * 0.08);
     let surfaceBounce = directAtSurface * hit.albedo * distanceAttenuation;
 
     radiance = radiance + throughput * surfaceBounce;
 
-    let nextDirection = hemisphereDirection(hit.normal, sampleIndex, bounce, probeIndex, rayCount);
+    let nextDirection = hemisphereDirection(hit.normal, sampleIndex, bounce, probeIndex + sampleSeed * 8191u, rayCount);
     let cosine = saturate(dot(hit.normal, nextDirection));
     throughput = throughput * hit.albedo * (BOUNCE_DECAY * max(0.15, cosine));
 
@@ -1224,31 +1643,67 @@ fn main(@builtin(global_invocation_id) globalId : vec3<u32>) {
   let ry = u32(params[1]);
   let rz = u32(params[2]);
   let probeCount = rx * ry * rz;
-  let batchOffset = u32(params[17]);
-  let batchCount = u32(params[18]);
-  let index = batchOffset + localIndex;
+  let sliceOffset = u32(params[17]);
+  let sliceCount = u32(params[18]);
+  let index = sliceOffset + localIndex;
 
-  if (localIndex >= batchCount || index >= probeCount) {
+  if (localIndex >= sliceCount || index >= probeCount) {
     return;
   }
 
-  let position = probePosition(index);
+  let gridPosition = probePosition(index);
   let lightCount = u32(params[3]);
   let exposure = params[12];
   let bounces = u32(clamp(params[13], 0.0, 16.0));
   let bounceRayCount = min(max(u32(params[20]), 1u), MAX_BOUNCE_RAY_COUNT);
+  let accumulationSampleIndex = u32(params[21]);
+  let accumulationSampleCount = max(u32(params[22]), 1u);
+  let accumulationWeight = 1.0 / f32(accumulationSampleCount);
+  let sampleSeed = accumulationSampleIndex + index * 4099u;
+  let relocationSeed = index * 4099u;
+  let outputBase = index * PROBE_STRIDE;
+  var relocatedProbe = RelocatedProbe(gridPosition, vec3<f32>(0.0), 0.0);
+  if (accumulationSampleIndex == 0u) {
+    relocatedProbe = relocateProbePosition(gridPosition, relocationSeed);
+  } else {
+    let storedOffset = vec3<f32>(
+      outputData[outputBase + 30u],
+      outputData[outputBase + 31u],
+      outputData[outputBase + 32u],
+    );
+    relocatedProbe = RelocatedProbe(gridPosition + storedOffset, storedOffset, outputData[outputBase + 33u]);
+  }
+  let position = relocatedProbe.position;
   var ambient = vec3<f32>(0.015, 0.017, 0.02);
   var directIrradiance = vec3<f32>(0.0);
   var bouncedIrradiance = vec3<f32>(0.0);
-  var dominantDirection = vec3<f32>(0.0, 1.0, 0.0);
+  var sh0 = ambient;
+  var sh1 = vec3<f32>(0.0);
+  var sh2 = vec3<f32>(0.0);
+  var sh3 = vec3<f32>(0.0);
+  var sh4 = vec3<f32>(0.0);
+  var sh5 = vec3<f32>(0.0);
+  var sh6 = vec3<f32>(0.0);
+  var sh7 = vec3<f32>(0.0);
+  var sh8 = vec3<f32>(0.0);
   var dominantIntensity = 0.0;
 
   for (var i = 0u; i < lightCount; i = i + 1u) {
-    let contribution = lightContribution(i, position);
+    let contribution = lightContribution(i, position, sampleSeed);
+    let basisA = shBasis4(contribution.directionToLight);
+    let basisB = shBasis5(contribution.directionToLight);
     directIrradiance = directIrradiance + contribution.irradiance;
+    sh0 = sh0 + contribution.irradiance * basisA.x;
+    sh1 = sh1 + contribution.irradiance * basisA.y;
+    sh2 = sh2 + contribution.irradiance * basisA.z;
+    sh3 = sh3 + contribution.irradiance * basisA.w;
+    sh4 = sh4 + contribution.irradiance * basisB.x;
+    sh5 = sh5 + contribution.irradiance * basisB.y;
+    sh6 = sh6 + contribution.irradiance * basisB.z;
+    sh7 = sh7 + contribution.irradiance * basisB.w;
+    sh8 = sh8 + contribution.irradiance * shBasis8(contribution.directionToLight);
 
     if (contribution.dominantIntensity > dominantIntensity) {
-      dominantDirection = contribution.directionToLight;
       dominantIntensity = contribution.dominantIntensity;
     }
   }
@@ -1258,28 +1713,70 @@ fn main(@builtin(global_invocation_id) globalId : vec3<u32>) {
       break;
     }
 
-    let direction = sphereDirection(sample, bounceRayCount, index);
-    bouncedIrradiance = bouncedIrradiance + traceBounceContribution(index, position, direction, lightCount, bounces, sample, bounceRayCount);
+    let direction = sphereDirection(sample, bounceRayCount, sampleSeed + sample * 101u);
+    let bounceContribution = traceBounceContribution(index, position, direction, lightCount, bounces, sample, bounceRayCount, sampleSeed);
+    let basisA = shBasis4(direction);
+    let basisB = shBasis5(direction);
+    bouncedIrradiance = bouncedIrradiance + bounceContribution;
+    sh0 = sh0 + bounceContribution * basisA.x;
+    sh1 = sh1 + bounceContribution * basisA.y;
+    sh2 = sh2 + bounceContribution * basisA.z;
+    sh3 = sh3 + bounceContribution * basisA.w;
+    sh4 = sh4 + bounceContribution * basisB.x;
+    sh5 = sh5 + bounceContribution * basisB.y;
+    sh6 = sh6 + bounceContribution * basisB.z;
+    sh7 = sh7 + bounceContribution * basisB.w;
+    sh8 = sh8 + bounceContribution * shBasis8(direction);
   }
 
-  ambient = ambient + directIrradiance + bouncedIrradiance;
-  ambient = ambient * exposure;
-  let outputBase = index * PROBE_STRIDE;
-  outputData[outputBase] = ambient.r;
-  outputData[outputBase + 1u] = ambient.g;
-  outputData[outputBase + 2u] = ambient.b;
-  outputData[outputBase + 3u] = 1.0;
-  outputData[outputBase + 4u] = ambient.r * dominantDirection.x;
-  outputData[outputBase + 5u] = ambient.g * dominantDirection.x;
-  outputData[outputBase + 6u] = ambient.b * dominantDirection.x;
-  outputData[outputBase + 7u] = 0.0;
-  outputData[outputBase + 8u] = ambient.r * dominantDirection.y;
-  outputData[outputBase + 9u] = ambient.g * dominantDirection.y;
-  outputData[outputBase + 10u] = ambient.b * dominantDirection.y;
-  outputData[outputBase + 11u] = 0.0;
-  outputData[outputBase + 12u] = dominantDirection.x;
-  outputData[outputBase + 13u] = dominantDirection.y;
-  outputData[outputBase + 14u] = dominantDirection.z;
-  outputData[outputBase + 15u] = dominantIntensity * exposure;
+  ambient = (ambient + directIrradiance + bouncedIrradiance) * exposure;
+  sh0 = sh0 * exposure;
+  sh1 = sh1 * exposure;
+  sh2 = sh2 * exposure;
+  sh3 = sh3 * exposure;
+  sh4 = sh4 * exposure;
+  sh5 = sh5 * exposure;
+  sh6 = sh6 * exposure;
+  sh7 = sh7 * exposure;
+  sh8 = sh8 * exposure;
+  outputData[outputBase] = outputData[outputBase] + sh0.r * accumulationWeight;
+  outputData[outputBase + 1u] = outputData[outputBase + 1u] + sh0.g * accumulationWeight;
+  outputData[outputBase + 2u] = outputData[outputBase + 2u] + sh0.b * accumulationWeight;
+  outputData[outputBase + 3u] = outputData[outputBase + 3u] + sh1.r * accumulationWeight;
+  outputData[outputBase + 4u] = outputData[outputBase + 4u] + sh1.g * accumulationWeight;
+  outputData[outputBase + 5u] = outputData[outputBase + 5u] + sh1.b * accumulationWeight;
+  outputData[outputBase + 6u] = outputData[outputBase + 6u] + sh2.r * accumulationWeight;
+  outputData[outputBase + 7u] = outputData[outputBase + 7u] + sh2.g * accumulationWeight;
+  outputData[outputBase + 8u] = outputData[outputBase + 8u] + sh2.b * accumulationWeight;
+  outputData[outputBase + 9u] = outputData[outputBase + 9u] + sh3.r * accumulationWeight;
+  outputData[outputBase + 10u] = outputData[outputBase + 10u] + sh3.g * accumulationWeight;
+  outputData[outputBase + 11u] = outputData[outputBase + 11u] + sh3.b * accumulationWeight;
+  outputData[outputBase + 12u] = outputData[outputBase + 12u] + sh4.r * accumulationWeight;
+  outputData[outputBase + 13u] = outputData[outputBase + 13u] + sh4.g * accumulationWeight;
+  outputData[outputBase + 14u] = outputData[outputBase + 14u] + sh4.b * accumulationWeight;
+  outputData[outputBase + 15u] = outputData[outputBase + 15u] + sh5.r * accumulationWeight;
+  outputData[outputBase + 16u] = outputData[outputBase + 16u] + sh5.g * accumulationWeight;
+  outputData[outputBase + 17u] = outputData[outputBase + 17u] + sh5.b * accumulationWeight;
+  outputData[outputBase + 18u] = outputData[outputBase + 18u] + sh6.r * accumulationWeight;
+  outputData[outputBase + 19u] = outputData[outputBase + 19u] + sh6.g * accumulationWeight;
+  outputData[outputBase + 20u] = outputData[outputBase + 20u] + sh6.b * accumulationWeight;
+  outputData[outputBase + 21u] = outputData[outputBase + 21u] + sh7.r * accumulationWeight;
+  outputData[outputBase + 22u] = outputData[outputBase + 22u] + sh7.g * accumulationWeight;
+  outputData[outputBase + 23u] = outputData[outputBase + 23u] + sh7.b * accumulationWeight;
+  outputData[outputBase + 24u] = outputData[outputBase + 24u] + sh8.r * accumulationWeight;
+  outputData[outputBase + 25u] = outputData[outputBase + 25u] + sh8.g * accumulationWeight;
+  outputData[outputBase + 26u] = outputData[outputBase + 26u] + sh8.b * accumulationWeight;
+  outputData[outputBase + 27u] = outputData[outputBase + 27u] + dominantIntensity * exposure * accumulationWeight;
+  if (accumulationSampleIndex == 0u) {
+    let localVisibility = probeLocalVisibility(position, relocationSeed);
+    outputData[outputBase + 28u] = localVisibility.x;
+    outputData[outputBase + 29u] = localVisibility.y;
+    outputData[outputBase + 30u] = relocatedProbe.offset.x;
+    outputData[outputBase + 31u] = relocatedProbe.offset.y;
+    outputData[outputBase + 32u] = relocatedProbe.offset.z;
+    outputData[outputBase + 33u] = relocatedProbe.strength;
+    outputData[outputBase + 34u] = 1.0;
+    outputData[outputBase + 35u] = 1.0;
+  }
 }
 `

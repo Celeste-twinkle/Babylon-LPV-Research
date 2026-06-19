@@ -12,7 +12,8 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
       </a>
       <nav class="nav-links" aria-label="Pages">
         <a href="./bake.html">Bake</a>
-        <a href="./direct-preview.html">Direct Preview</a>
+        <a href="./direct-preview-webgl.html">Preview WebGL</a>
+        <a href="./direct-preview-webgpu.html">Preview WebGPU</a>
         <a href="./validate-webgl.html">Validate WebGL</a>
         <a href="./validate-webgpu.html">Validate WebGPU</a>
       </nav>
@@ -28,7 +29,8 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
         </p>
         <div class="landing-actions">
           <a class="primary-link" href="./bake.html">Open bake page</a>
-          <a class="secondary-link" href="./direct-preview.html">Open direct .ivol preview</a>
+          <a class="secondary-link" href="./direct-preview-webgl.html">Open WebGL preview</a>
+          <a class="secondary-link" href="./direct-preview-webgpu.html">Open WebGPU preview</a>
           <a class="secondary-link" href="./validate-webgl.html">Open WebGL validation</a>
           <a class="secondary-link" href="./validate-webgpu.html">Open WebGPU validation</a>
         </div>

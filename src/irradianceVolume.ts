@@ -6,7 +6,8 @@ export const IRRADIANCE_VOLUME_BINARY_DB = 'babylon-lpv-research'
 export const IRRADIANCE_VOLUME_BINARY_STORE = 'volume-assets'
 export const IRRADIANCE_VOLUME_BINARY_KEY = 'latest-sponza.ivol'
 export const IVOL_HEADER_BYTES = 96
-export const IVOL_PROBE_STRIDE_FLOATS = 16
+export const IVOL_BINARY_VERSION = 5
+export const IVOL_PROBE_STRIDE_FLOATS = 36
 
 export type Vec3Tuple = [number, number, number]
 
@@ -270,7 +271,7 @@ export const createIvolBinary = (
   bytes[1] = 0x56
   bytes[2] = 0x4f
   bytes[3] = 0x4c
-  view.setUint32(4, 1, true)
+  view.setUint32(4, IVOL_BINARY_VERSION, true)
   view.setUint32(8, IVOL_HEADER_BYTES, true)
   view.setUint32(12, IVOL_PROBE_STRIDE_FLOATS, true)
   view.setUint32(16, volume.resolution[0], true)
@@ -290,6 +291,10 @@ export const createIvolBinary = (
 }
 
 export const parseIvolBinary = (buffer: ArrayBuffer): BinaryIrradianceVolume => {
+  if (buffer.byteLength < IVOL_HEADER_BYTES) {
+    throw new Error('IVOL binary is too small.')
+  }
+
   const view = new DataView(buffer)
 
   if (
@@ -305,11 +310,15 @@ export const parseIvolBinary = (buffer: ArrayBuffer): BinaryIrradianceVolume => 
   const payloadOffset = view.getUint32(8, true)
   const probeStrideFloats = view.getUint32(12, true)
 
-  if (version !== 1) {
+  if (version !== IVOL_BINARY_VERSION) {
     throw new Error(`Unsupported IVOL version: ${version}.`)
   }
 
-  if (payloadOffset % 4 !== 0 || probeStrideFloats !== IVOL_PROBE_STRIDE_FLOATS) {
+  if (
+    payloadOffset < IVOL_HEADER_BYTES ||
+    payloadOffset % 4 !== 0 ||
+    probeStrideFloats !== IVOL_PROBE_STRIDE_FLOATS
+  ) {
     throw new Error('Unsupported IVOL layout.')
   }
 
@@ -332,6 +341,15 @@ export const parseIvolBinary = (buffer: ArrayBuffer): BinaryIrradianceVolume => 
   }
   const expectedFloats =
     resolution[0] * resolution[1] * resolution[2] * probeStrideFloats
+  const expectedBytes = expectedFloats * Float32Array.BYTES_PER_ELEMENT
+
+  if (
+    resolution.some((axis) => axis < 1) ||
+    !Number.isSafeInteger(expectedFloats) ||
+    payloadOffset + expectedBytes > buffer.byteLength
+  ) {
+    throw new Error('Invalid IVOL payload bounds.')
+  }
 
   return {
     kind: 'binary',
@@ -418,6 +436,44 @@ export const volumeSummary = (volume: IrradianceVolumeData): string =>
 export const binaryVolumeSummary = (volume: BinaryIrradianceVolume): string =>
   `${volume.resolution[0]} x ${volume.resolution[1]} x ${volume.resolution[2]} / ${volume.payload.length / volume.probeStrideFloats} probes`
 
+export const binaryVolumeQualitySummary = (volume: BinaryIrradianceVolume): string => {
+  const probeCount = volume.payload.length / volume.probeStrideFloats
+  let ambientMin = Number.POSITIVE_INFINITY
+  let ambientMax = 0
+  let visibilitySum = 0
+  let proximitySum = 0
+  let relocationSum = 0
+  let relocatedCount = 0
+
+  for (let index = 0; index < probeCount; index += 1) {
+    const base = index * volume.probeStrideFloats
+    const ambient = luminance(volume.payload[base], volume.payload[base + 1], volume.payload[base + 2])
+    const visibility = clamp01(volume.payload[base + 28])
+    const proximity = clamp01(volume.payload[base + 29])
+    const relocation = clamp01(volume.payload[base + 33])
+
+    ambientMin = Math.min(ambientMin, ambient)
+    ambientMax = Math.max(ambientMax, ambient)
+    visibilitySum += visibility
+    proximitySum += proximity
+    relocationSum += relocation
+    if (relocation > 0.001) {
+      relocatedCount += 1
+    }
+  }
+
+  if (probeCount <= 0) {
+    return 'quality: empty volume'
+  }
+
+  return [
+    `quality: ambient ${formatCompact(ambientMin)}-${formatCompact(ambientMax)}`,
+    `visibility avg ${formatPercent(visibilitySum / probeCount)}`,
+    `proximity avg ${formatPercent(proximitySum / probeCount)}`,
+    `relocated ${formatPercent(relocatedCount / probeCount)} avg ${formatPercent(relocationSum / probeCount)}`,
+  ].join(', ')
+}
+
 const readProbe = (
   volume: IrradianceVolumeData,
   x: number,
@@ -442,13 +498,29 @@ const readBinaryProbe = (
   const base =
     probeIndex(x, y, z, volume.resolution) * volume.probeStrideFloats
   const payload = volume.payload
+  const dominantDirection = new Vector3(
+    luminance(payload[base + 3], payload[base + 4], payload[base + 5]),
+    luminance(payload[base + 6], payload[base + 7], payload[base + 8]),
+    luminance(payload[base + 9], payload[base + 10], payload[base + 11]),
+  )
 
   return {
     ambient: new Color3(payload[base], payload[base + 1], payload[base + 2]),
-    dominantDirection: new Vector3(payload[base + 12], payload[base + 13], payload[base + 14]),
-    dominantIntensity: payload[base + 15],
+    dominantDirection: dominantDirection.lengthSquared() > 0.000001
+      ? dominantDirection.normalize()
+      : new Vector3(0, 1, 0),
+    dominantIntensity: payload[base + 27],
   }
 }
+
+const luminance = (r: number, g: number, b: number): number =>
+  r * 0.2126 + g * 0.7152 + b * 0.0722
+
+const formatCompact = (value: number): string =>
+  Number.isFinite(value) ? value.toFixed(value < 1 ? 4 : 2) : 'n/a'
+
+const formatPercent = (value: number): string =>
+  `${Math.round(clamp01(value) * 100)}%`
 
 const lerp = (a: number, b: number, amount: number): number => a + (b - a) * amount
 

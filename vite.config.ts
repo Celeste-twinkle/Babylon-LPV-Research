@@ -11,6 +11,8 @@ export default defineConfig({
         index: resolve(__dirname, 'index.html'),
         bake: resolve(__dirname, 'bake.html'),
         directPreview: resolve(__dirname, 'direct-preview.html'),
+        directPreviewWebgl: resolve(__dirname, 'direct-preview-webgl.html'),
+        directPreviewWebgpu: resolve(__dirname, 'direct-preview-webgpu.html'),
         validate: resolve(__dirname, 'validate.html'),
         validateWebgl: resolve(__dirname, 'validate-webgl.html'),
         validateWebgpu: resolve(__dirname, 'validate-webgpu.html'),
