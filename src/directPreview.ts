@@ -20,12 +20,22 @@ type PreviewSettings = {
   speed: number
   distance: number
   intensity: number
+  displayExposureEv: number
+  specularEnabled: boolean
+  dominantSpecular: boolean
+  normalBias: number
 }
 
 const settings: PreviewSettings = {
   speed: 0.62,
   distance: 1.0,
   intensity: 1.0,
+  displayExposureEv: 0,
+  specularEnabled: true,
+  dominantSpecular: false,
+  // Static Sponza surfaces need roughly one probe-cell of outward bias so
+  // their trilinear sample does not blend with probes behind the surface.
+  normalBias: 0.3,
 }
 
 type PreviewRenderer = 'webgl' | 'webgpu'
@@ -75,7 +85,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           <p>
             This page fetches <code>${DIRECT_BUNDLE_PATH}</code> directly. Several
             PBR diagnostic receivers are created around the default bake light positions.
-            Static Sponza uses baked surface lighting; moving receivers sample the volume.
+            Static Sponza and moving receivers sample the same compact L1 volumes.
           </p>
         </section>
 
@@ -91,6 +101,22 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           <label>
             Volume intensity
             <input id="intensity" type="number" min="0" max="4" step="0.05" value="${settings.intensity}" />
+          </label>
+          <label>
+            Display exposure EV
+            <input id="displayExposureEv" type="number" min="-4" max="4" step="0.25" value="${settings.displayExposureEv}" />
+          </label>
+          <label>
+            Normal bias
+            <input id="normalBias" type="number" min="-0.5" max="0.5" step="0.001" value="${settings.normalBias}" />
+          </label>
+          <label class="checkbox-label">
+            <input id="specularEnabled" type="checkbox" ${settings.specularEnabled ? 'checked' : ''} />
+            Volume speculars
+          </label>
+          <label class="checkbox-label">
+            <input id="dominantSpecular" type="checkbox" ${settings.dominantSpecular ? 'checked' : ''} />
+            Dominant-dir speculars
           </label>
         </section>
 
@@ -167,6 +193,10 @@ function syncSettingsFromInputs(): void {
   settings.speed = readNumber('#speed', settings.speed)
   settings.distance = readNumber('#distance', settings.distance)
   settings.intensity = readNumber('#intensity', settings.intensity)
+  settings.displayExposureEv = readNumber('#displayExposureEv', settings.displayExposureEv)
+  settings.normalBias = readNumber('#normalBias', settings.normalBias)
+  settings.specularEnabled = mustQuery<HTMLInputElement>('#specularEnabled').checked
+  settings.dominantSpecular = mustQuery<HTMLInputElement>('#dominantSpecular').checked
 }
 
 function readNumber(selector: string, defaultValue: number): number {

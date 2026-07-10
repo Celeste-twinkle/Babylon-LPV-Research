@@ -26,6 +26,10 @@ type ValidateSettings = {
   speed: number
   distance: number
   intensity: number
+  displayExposureEv: number
+  specularEnabled: boolean
+  dominantSpecular: boolean
+  normalBias: number
   showProbes: boolean
 }
 
@@ -33,6 +37,11 @@ const settings: ValidateSettings = {
   speed: 0.62,
   distance: 1.0,
   intensity: 1.0,
+  displayExposureEv: 0,
+  specularEnabled: true,
+  dominantSpecular: false,
+  // Match the direct preview's surface-safe default for this 3 voxels/m bake.
+  normalBias: 0.3,
   showProbes: false,
 }
 
@@ -99,6 +108,22 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
             Volume intensity
             <input id="intensity" type="number" min="0" max="4" step="0.05" value="${settings.intensity}" />
           </label>
+          <label>
+            Display exposure EV
+            <input id="displayExposureEv" type="number" min="-4" max="4" step="0.25" value="${settings.displayExposureEv}" />
+          </label>
+          <label>
+            Normal bias
+            <input id="normalBias" type="number" min="-0.5" max="0.5" step="0.001" value="${settings.normalBias}" />
+          </label>
+          <label class="checkbox-label">
+            <input id="specularEnabled" type="checkbox" ${settings.specularEnabled ? 'checked' : ''} />
+            Volume speculars
+          </label>
+          <label class="checkbox-label">
+            <input id="dominantSpecular" type="checkbox" ${settings.dominantSpecular ? 'checked' : ''} />
+            Dominant-dir speculars
+          </label>
           <label class="checkbox-label">
             <input id="showProbes" type="checkbox" ${settings.showProbes ? 'checked' : ''} />
             Show probe debug
@@ -144,7 +169,9 @@ try {
   const preview = createDirectPreviewRenderer(app, {
     namePrefix: 'validate',
     shaderErrors,
-    frameCameraOnLoad: false,
+    // Use the same diagnostic framing as the checked-in preview so an
+    // uploaded bundle can be compared without a camera-dependent mismatch.
+    frameCameraOnLoad: true,
   })
 
   uploadVolumeButton.addEventListener('click', () => {
@@ -278,6 +305,10 @@ function syncSettingsFromInputs(): void {
   settings.speed = readNumber('#speed', settings.speed)
   settings.distance = readNumber('#distance', settings.distance)
   settings.intensity = readNumber('#intensity', settings.intensity)
+  settings.displayExposureEv = readNumber('#displayExposureEv', settings.displayExposureEv)
+  settings.normalBias = readNumber('#normalBias', settings.normalBias)
+  settings.specularEnabled = mustQuery<HTMLInputElement>('#specularEnabled').checked
+  settings.dominantSpecular = mustQuery<HTMLInputElement>('#dominantSpecular').checked
   settings.showProbes = mustQuery<HTMLInputElement>('#showProbes').checked
 }
 

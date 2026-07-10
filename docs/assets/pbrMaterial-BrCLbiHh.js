@@ -1,1 +1,0 @@
-import{n as e,r as t,t as n}from"./pbrMaterial-CfPkzdfn.js";export{n as PBRMaterial,e as RegisterPBRMaterial,t as RegisterPbrMaterial};

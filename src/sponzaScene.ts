@@ -3,6 +3,7 @@ import '@babylonjs/loaders/glTF'
 import type { AbstractMesh } from '@babylonjs/core/Meshes/abstractMesh'
 import type { AbstractEngine } from '@babylonjs/core/Engines/abstractEngine'
 import { ArcRotateCamera } from '@babylonjs/core/Cameras/arcRotateCamera'
+import { RegisterBufferAlign } from '@babylonjs/core/Buffers/buffer.align.pure'
 import { Color3, Color4 } from '@babylonjs/core/Maths/math.color'
 import { Engine } from '@babylonjs/core/Engines/engine'
 import { LightConstants } from '@babylonjs/core/Lights/lightConstants'
@@ -14,6 +15,8 @@ import { WebGPUEngine } from '@babylonjs/core/Engines/webgpuEngine'
 
 import type { Vec3Tuple } from './irradianceVolume'
 import { vector3ToTuple } from './irradianceVolume'
+
+RegisterBufferAlign()
 
 export const SPONZA_MODEL_PATH = 'assets/sponza/glTF/Sponza.gltf'
 const MAX_DEVICE_PIXEL_RATIO = 2
@@ -60,6 +63,9 @@ export const createSponzaApp = async (
       stencil: true,
       antialias: true,
     })
+  if (usingWebGPU) {
+    ensureWebGpuVertexBufferRuntime(engine)
+  }
   applyDevicePixelRatio(engine)
 
   const scene = new Scene(engine)
@@ -138,6 +144,66 @@ export const createSponzaApp = async (
       scene.dispose()
       engine.dispose()
     },
+  }
+}
+
+type EffectiveVertexBuffer = {
+  byteStride: number
+  byteOffset: number
+  _alignedBuffer?: {
+    byteStride: number
+    getBuffer: () => unknown
+  }
+  _buffer: {
+    getBuffer: () => unknown
+  }
+  effectiveByteStride?: number
+}
+
+const ensureWebGpuVertexBufferRuntime = (engine: AbstractEngine): void => {
+  const emptyVertexBuffer = (engine as AbstractEngine & {
+    _emptyVertexBuffer?: EffectiveVertexBuffer
+  })._emptyVertexBuffer
+
+  if (!emptyVertexBuffer) {
+    throw new Error('WebGPU initialization did not create Babylon\'s empty vertex buffer.')
+  }
+
+  if (Number.isFinite(emptyVertexBuffer.effectiveByteStride)) {
+    return
+  }
+
+  // Babylon's tree-shakeable WebGPU build can be evaluated without the
+  // buffer.align side effect when Vite serves an outdated optimized chunk.
+  // Repair the actual VertexBuffer prototype used by this GPUDevice so an
+  // old module graph cannot submit an invalid arrayStride to WebGPU.
+  const prototype = Object.getPrototypeOf(emptyVertexBuffer) as object
+  Object.defineProperties(prototype, {
+    effectiveByteStride: {
+      get(this: EffectiveVertexBuffer): number {
+        return this._alignedBuffer?.byteStride ?? this.byteStride
+      },
+      enumerable: true,
+      configurable: true,
+    },
+    effectiveByteOffset: {
+      get(this: EffectiveVertexBuffer): number {
+        return this._alignedBuffer ? 0 : this.byteOffset
+      },
+      enumerable: true,
+      configurable: true,
+    },
+    effectiveBuffer: {
+      get(this: EffectiveVertexBuffer): unknown {
+        return this._alignedBuffer?.getBuffer() ?? this._buffer.getBuffer()
+      },
+      enumerable: true,
+      configurable: true,
+    },
+  })
+
+  if (!Number.isFinite(emptyVertexBuffer.effectiveByteStride)) {
+    throw new Error('Babylon WebGPU vertex-buffer alignment runtime is unavailable.')
   }
 }
 

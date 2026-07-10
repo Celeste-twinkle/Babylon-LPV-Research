@@ -3,18 +3,18 @@ import { Material } from '@babylonjs/core/Materials/material'
 import { Color3 } from '@babylonjs/core/Maths/math.color'
 import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial'
 import { Vector3 } from '@babylonjs/core/Maths/math.vector'
+import { ImageProcessingConfiguration } from '@babylonjs/core/Materials/imageProcessingConfiguration'
 
 import type { BinaryIrradianceVolume } from './irradianceVolume'
 import { sampleBinaryIrradianceVolume } from './irradianceVolume'
 import type {
   IrradianceVolumePbrPlugin,
   IrradianceVolumeTexture,
-  StaticShadowMaskTexture,
 } from './irradianceVolumePbrPlugin'
 import {
   createIrradianceVolumeTexture,
-  createStaticShadowMaskTexture,
   installIrradianceVolumePbrPlugins,
+  setIrradianceVolumePluginPbrSettings,
   setIrradianceVolumePluginIntensity,
 } from './irradianceVolumePbrPlugin'
 import type { BakedDynamicLighting, BakedDynamicObject } from './bakedSponzaRendering'
@@ -30,6 +30,7 @@ import {
   syncBakedSponzaLightingPlugins,
 } from './bakedSponzaRendering'
 import {
+  hasIrradianceBakeBundleMagic,
   irradianceBakeBundleQualitySummary,
   irradianceBakeBundleSummary,
   parseIrradianceBakeBundle,
@@ -42,6 +43,10 @@ export type DirectPreviewSettings = {
   speed: number
   distance: number
   intensity: number
+  displayExposureEv: number
+  specularEnabled: boolean
+  dominantSpecular: boolean
+  normalBias: number
 }
 
 export type DirectPreviewLoadedState = {
@@ -52,7 +57,6 @@ export type DirectPreviewLoadedState = {
   dynamicObjects: BakedDynamicObject[]
   staticAudit: StaticSceneAudit
   compileAudit: CompileAudit
-  shadowMaskTexture: StaticShadowMaskTexture | null
   dynamicLightCount: number
   dynamicPluginCount: number
   staticPluginCount: number
@@ -79,8 +83,9 @@ type DirectPreviewRendererOptions = {
   namePrefix: string
   shaderErrors?: string[]
   frameCameraOnLoad?: boolean
-  loadStaticShadowMask?: boolean
   forceStaticCpuPreviewMaterials?: boolean
+  addRealtimeDirectLights?: boolean
+  auditMaterials?: boolean
 }
 
 type StaticCpuPreviewMaterial = {
@@ -108,8 +113,6 @@ type RuntimeBundleResources = {
   volume: BinaryIrradianceVolume
   detailVolume: BinaryIrradianceVolume | null
   volumeTexture: IrradianceVolumeTexture | null
-  detailVolumeTexture: IrradianceVolumeTexture | null
-  shadowMaskTexture: StaticShadowMaskTexture | null
   dynamicObjects: BakedDynamicObject[]
   dynamicLighting: BakedDynamicLighting | null
   dynamicPlugins: IrradianceVolumePbrPlugin[]
@@ -129,6 +132,7 @@ export function createDirectPreviewRenderer(
   let loadedState: DirectPreviewLoadedState | null = null
 
   disableSponzaRuntimeLighting(app)
+  configureHdrDisplay(app)
   configureBakedSponzaStaticMeshes(app.importedMeshes)
 
   const loadBundle = async (
@@ -139,21 +143,17 @@ export function createDirectPreviewRenderer(
 
     const volume = bundle.baseVolume
     const detailVolume = bundle.detailVolume
-    const volumeTexture = createIrradianceVolumeTexture(app.scene, volume)
-    const detailVolumeTexture = detailVolume
-      ? createIrradianceVolumeTexture(app.scene, detailVolume)
-      : null
-    const shadowMaskTexture = bundle.shadowMask && (options.loadStaticShadowMask ?? true)
-      ? createStaticShadowMaskTexture(app.scene, bundle.shadowMask)
-      : null
+    const volumeTexture = createIrradianceVolumeTexture(app.scene, volume, detailVolume)
     staticPlugins ??= installIrradianceVolumePbrPlugins(app.importedMeshes)
     const dynamicObjects = createBakedDynamicObjects(app.scene, volume, options.namePrefix)
-    const dynamicLighting = createBakedDynamicDirectLighting(
-      app.scene,
-      dynamicObjects.map((object) => object.mesh),
-      app.importedMeshes,
-      options.namePrefix,
-    )
+    const dynamicLighting = options.addRealtimeDirectLights
+      ? createBakedDynamicDirectLighting(
+        app.scene,
+        dynamicObjects.map((object) => object.mesh),
+        app.importedMeshes,
+        options.namePrefix,
+      )
+      : null
     const dynamicPlugins = installIrradianceVolumePbrPlugins(dynamicObjects.map((object) => object.mesh))
     const allPlugins = [...staticPlugins, ...dynamicPlugins]
 
@@ -165,16 +165,16 @@ export function createDirectPreviewRenderer(
       staticPlugins,
       dynamicPlugins,
       volumeTexture,
-      detailVolumeTexture,
-      shadowMaskTexture,
       intensity: 1,
     })
 
     const staticAudit = collectStaticSceneAudit(app.importedMeshes, staticPlugins.length)
-    const compileAudit = await forceCompileStaticMaterials([
-      ...app.importedMeshes,
-      ...dynamicObjects.map((object) => object.mesh),
-    ])
+    const compileAudit = options.auditMaterials
+      ? await forceCompileStaticMaterials([
+        ...app.importedMeshes,
+        ...dynamicObjects.map((object) => object.mesh),
+      ])
+      : { checkedCount: 0, compiledCount: 0, errors: [] }
     const staticCpuPreviewMaterials = options.forceStaticCpuPreviewMaterials
       ? enableStaticCpuPreviewMaterials(app.importedMeshes, volume, detailVolume ?? undefined, 1)
       : []
@@ -183,8 +183,6 @@ export function createDirectPreviewRenderer(
       volume,
       detailVolume,
       volumeTexture,
-      detailVolumeTexture,
-      shadowMaskTexture,
       dynamicObjects,
       dynamicLighting,
       dynamicPlugins,
@@ -199,8 +197,7 @@ export function createDirectPreviewRenderer(
       dynamicObjects,
       staticAudit,
       compileAudit,
-      shadowMaskTexture,
-      dynamicLightCount: dynamicLighting.lights.length,
+      dynamicLightCount: dynamicLighting?.lights.length ?? 0,
       dynamicPluginCount: dynamicPlugins.length,
       staticPluginCount: staticPlugins.length,
       cpuPreviewCount: staticCpuPreviewMaterials.length,
@@ -215,6 +212,12 @@ export function createDirectPreviewRenderer(
     }
 
     setIrradianceVolumePluginIntensity(resources.allPlugins, settings.intensity)
+    app.scene.imageProcessingConfiguration.exposure = 2 ** clamp(settings.displayExposureEv, -8, 8)
+    setIrradianceVolumePluginPbrSettings(resources.allPlugins, {
+      specularEnabled: settings.specularEnabled,
+      dominantSpecular: settings.dominantSpecular,
+      normalBias: settings.normalBias,
+    })
     updateStaticCpuPreviewMaterials(
       resources.staticCpuPreviewMaterials,
       resources.volume,
@@ -273,6 +276,17 @@ export function createDirectPreviewRenderer(
   }
 }
 
+function configureHdrDisplay(app: SponzaApp): void {
+  const imageProcessing = app.scene.imageProcessingConfiguration
+
+  imageProcessing.toneMappingEnabled = true
+  imageProcessing.toneMappingType = ImageProcessingConfiguration.TONEMAPPING_ACES
+  imageProcessing.exposure = 1
+  imageProcessing.contrast = 1
+  imageProcessing.ditheringEnabled = true
+  imageProcessing.ditheringIntensity = 1 / 255
+}
+
 export function installDirectPreviewShaderErrorAudit(app: SponzaApp): string[] {
   const errors: string[] = []
 
@@ -287,9 +301,10 @@ export function installDirectPreviewShaderErrorAudit(app: SponzaApp): string[] {
 
 export async function loadDirectPreviewBundle(bundlePath: string): Promise<DirectPreviewBundle> {
   const response = await fetch(assetUrl(bundlePath))
+  const directBuffer = response.ok ? await response.arrayBuffer() : null
 
-  if (response.ok) {
-    return parseIrradianceBakeBundle(await response.arrayBuffer())
+  if (directBuffer && hasIrradianceBakeBundleMagic(directBuffer)) {
+    return parseIrradianceBakeBundle(directBuffer)
   }
 
   const chunkedBundle = await tryLoadChunkedDirectPreviewBundle(bundlePath)
@@ -297,11 +312,11 @@ export async function loadDirectPreviewBundle(bundlePath: string): Promise<Direc
     return parseIrradianceBakeBundle(chunkedBundle)
   }
 
-  if (!response.ok) {
-    throw new Error(`Could not fetch ${bundlePath}: HTTP ${response.status}.`)
+  if (response.ok) {
+    throw new Error(`Could not load ${bundlePath}: the response is not an IVPK bundle and no chunk manifest was found.`)
   }
 
-  return parseIrradianceBakeBundle(await response.arrayBuffer())
+  throw new Error(`Could not fetch ${bundlePath}: HTTP ${response.status}.`)
 }
 
 type ChunkedDirectPreviewManifest = {
@@ -354,18 +369,24 @@ async function tryLoadChunkedDirectPreviewBundle(bundlePath: string): Promise<Ar
 export function formatDirectPreviewSummary(state: DirectPreviewLoadedState): string {
   const bundle = state.bundle
 
-  return `${state.sourceLabel}: ${irradianceBakeBundleSummary(bundle)}. ${irradianceBakeBundleQualitySummary(bundle)}. Static surface lightmap ${state.shadowMaskTexture ? 'on' : bundle.shadowMask ? 'off' : 'missing'}. Sponza meshes ${state.staticAudit.visibleMeshCount}/${state.staticAudit.meshCount} visible, vertices ${state.staticAudit.vertexCount}.`
+  return `${state.sourceLabel}: ${irradianceBakeBundleSummary(bundle)}. ${irradianceBakeBundleQualitySummary(bundle)}. Sponza meshes ${state.staticAudit.visibleMeshCount}/${state.staticAudit.meshCount} visible, vertices ${state.staticAudit.vertexCount}.`
 }
 
 export function formatDirectPreviewMaterialLine(
   state: DirectPreviewLoadedState,
   shaderErrorCount: number,
 ): string {
-  return `${state.staticAudit.pbrMaterialCount}/${state.staticAudit.materialCount} static PBR material(s), ${state.staticPluginCount} baked surface plugin(s), ${state.dynamicPluginCount} dynamic VLM plugin(s), ${state.dynamicLightCount} dynamic direct light(s), compiled ${state.compileAudit.compiledCount}/${state.compileAudit.checkedCount}, shader errors ${shaderErrorCount}, static lightmap ${state.shadowMaskTexture ? 'bound' : 'not bound'}, CPU static preview ${state.cpuPreviewCount}.`
+  const compileState = state.compileAudit.checkedCount > 0
+    ? `audited ${state.compileAudit.compiledCount}/${state.compileAudit.checkedCount}`
+    : 'materials compile on demand'
+
+  return `${state.staticAudit.pbrMaterialCount}/${state.staticAudit.materialCount} static PBR material(s), ${state.staticPluginCount} static volume plugin(s), ${state.dynamicPluginCount} dynamic volume plugin(s), ${state.dynamicLightCount} realtime direct light(s), ${compileState}, shader errors ${shaderErrorCount}.`
 }
 
 export function formatDirectPreviewStatus(state: DirectPreviewLoadedState): string {
-  return `Loaded direct bundle and compiled ${state.compileAudit.compiledCount} Sponza material(s).`
+  return state.compileAudit.checkedCount > 0
+    ? `Loaded direct bundle and audited ${state.compileAudit.compiledCount} Sponza material(s).`
+    : 'Loaded direct bundle; PBR volume materials compile on demand.'
 }
 
 export function formatDirectPreviewErrorLine(
@@ -397,20 +418,10 @@ function disposeRuntimeResources(resources: RuntimeBundleResources | null): void
     preview.material.dispose()
   }
   disposeIrradianceVolumeTexture(resources.volumeTexture)
-  disposeIrradianceVolumeTexture(resources.detailVolumeTexture)
-  disposeStaticShadowMaskTexture(resources.shadowMaskTexture)
 }
 
 function disposeIrradianceVolumeTexture(texture: IrradianceVolumeTexture | null): void {
-  for (const shTexture of texture?.shTextures ?? []) {
-    shTexture.dispose()
-  }
-}
-
-function disposeStaticShadowMaskTexture(texture: StaticShadowMaskTexture | null): void {
   texture?.texture.dispose()
-  texture?.lightTexture.dispose()
-  texture?.depthTexture.dispose()
 }
 
 function collectStaticSceneAudit(meshes: AbstractMesh[], pluginCount: number): StaticSceneAudit {
@@ -583,9 +594,9 @@ function frameDiagnosticObjects(
   )
 
   camera.setTarget(clampToBinaryVolume(center, volume))
-  camera.alpha = Math.PI * 0.74
-  camera.beta = Math.PI * 0.36
-  camera.radius = clamp(Math.max(volumeSize.x, volumeSize.z) * 0.46, 10, 24)
+  camera.alpha = Math.PI * 1.5
+  camera.beta = Math.PI * 0.43
+  camera.radius = clamp(Math.min(volumeSize.x, volumeSize.z) * 0.38, 5, 7)
 }
 
 function toneMapPreviewColor(color: Color3): Color3 {

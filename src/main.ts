@@ -21,11 +21,11 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
 
     <main class="landing">
       <section class="landing-copy">
-        <p class="eyebrow">MVP workflow</p>
-        <h1>Sponza volume lighting pipeline.</h1>
+        <p class="eyebrow">L1 SH volume lighting</p>
+        <h1>WebGPU bake, WebGL2/WebGPU render.</h1>
         <p>
-          Use the bake page to generate an IrradianceVolume JSON from the classic Sponza
-          scene, then use the validation page to sample that volume on moving dynamic objects.
+          Bake occluded multi-bounce irradiance into a compact VRCLightVolumes-style
+          L1 SH atlas, then use the same Babylon PBR path on both rendering backends.
         </p>
         <div class="landing-actions">
           <a class="primary-link" href="./bake.html">Open bake page</a>
@@ -39,23 +39,23 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
       <section class="workflow-grid" aria-label="Workflow">
         <article>
           <span>01</span>
-          <h2>Generate</h2>
-          <p>Load Sponza, choose a regular 3D grid, run CPU probe visibility sampling, and export JSON.</p>
+          <h2>Bake</h2>
+          <p>Trace Sponza geometry and configured area-like point lights with a WebGPU compute BVH.</p>
         </article>
         <article>
           <span>02</span>
-          <h2>Store</h2>
-          <p>The latest volume is saved in localStorage so the validation page can pick it up immediately.</p>
+          <h2>Pack</h2>
+          <p>Store L0 RGB and L1 RGB vectors as three padded islands per volume in an .ivpack asset.</p>
         </article>
         <article>
           <span>03</span>
           <h2>Direct preview</h2>
-          <p>Load the downloaded binary asset directly and animate PBR objects around the default bake lights.</p>
+          <p>Load the checked-in binary bundle and sample one shared 3D atlas from Babylon PBR materials.</p>
         </article>
         <article>
           <span>04</span>
           <h2>Validate</h2>
-          <p>Move dynamic meshes through Sponza and verify trilinear volume sampling in world space.</p>
+          <p>Upload a fresh bake and verify hardware trilinear interpolation on WebGL2 and WebGPU.</p>
         </article>
       </section>
     </main>

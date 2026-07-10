@@ -1,4 +1,5 @@
 import './style.css'
+import '@babylonjs/core/Culling/ray'
 
 import type { AbstractMesh } from '@babylonjs/core/Meshes/abstractMesh'
 import { Color3 } from '@babylonjs/core/Maths/math.color'
@@ -9,10 +10,11 @@ import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial'
 import { Vector3 } from '@babylonjs/core/Maths/math.vector'
 import { GizmoManager } from '@babylonjs/core/Gizmos/gizmoManager'
 import { LightConstants } from '@babylonjs/core/Lights/lightConstants'
+import { ImageProcessingConfiguration } from '@babylonjs/core/Materials/imageProcessingConfiguration'
 import { PointLight } from '@babylonjs/core/Lights/pointLight'
 import { Pane } from 'tweakpane'
 
-import type { IrradianceVolumeData, Vec3Tuple } from './irradianceVolume'
+import type { IrradianceVolumeGrid, Vec3Tuple } from './irradianceVolume'
 import {
   binaryVolumeSummary,
   getProbePosition,
@@ -33,44 +35,76 @@ import {
   irradianceBakeBundleSummary,
   parseIrradianceBakeBundle,
 } from './irradianceBakeBundle'
-import {
-  bakeStaticShadowMask,
-} from './staticShadowMask'
 
 type BakeSettings = {
+  adaptiveResolution: boolean
+  voxelsPerUnit: number
   resolutionX: number
   resolutionY: number
   resolutionZ: number
+  denoise: boolean
+  dilateInvalidProbes: boolean
+  dilationIterations: number
+  dilationBackfaceBias: number
+  relocateProbes: boolean
+  pointLightShadows: boolean
   bounces: number
   bounceRayCount: number
   areaSamples: number
   accumulationSamples: number
   exposure: number
+  shadows: number
+  highlights: number
+  previewExposureEv: number
   maxProbeCount: number
-  shadowMaskResolution: number
+  detailVolumeEnabled: boolean
+  detailDensityMultiplier: number
 }
 
 const settings: BakeSettings = {
-  resolutionX: 64,
-  resolutionY: 32,
-  resolutionZ: 64,
-  bounces: 4,
+  adaptiveResolution: true,
+  voxelsPerUnit: 3,
+  resolutionX: 16,
+  resolutionY: 16,
+  resolutionZ: 16,
+  denoise: true,
+  dilateInvalidProbes: true,
+  dilationIterations: 1,
+  dilationBackfaceBias: 0.1,
+  relocateProbes: true,
+  pointLightShadows: true,
+  bounces: 2,
   bounceRayCount: 4,
-  areaSamples: 4,
-  accumulationSamples: 4,
-  exposure: 1.0,
+  areaSamples: 2,
+  accumulationSamples: 2,
+  exposure: 0,
+  shadows: 0,
+  highlights: 0,
+  previewExposureEv: 0,
   maxProbeCount: 262144,
-  shadowMaskResolution: 2048,
+  detailVolumeEnabled: false,
+  detailDensityMultiplier: 1.5,
 }
 
-const SHADOW_MASK_RESOLUTION_OPTIONS = {
-  '512 px': 512,
-  '1024 px': 1024,
-  '2048 px': 2048,
-  '4096 px': 4096,
+if (new URLSearchParams(location.search).has('smoke')) {
+  Object.assign(settings, {
+    adaptiveResolution: false,
+    resolutionX: 8,
+    resolutionY: 4,
+    resolutionZ: 8,
+    denoise: true,
+    dilateInvalidProbes: true,
+    dilationIterations: 1,
+    relocateProbes: true,
+    pointLightShadows: true,
+    bounces: 0,
+    bounceRayCount: 1,
+    areaSamples: 1,
+    accumulationSamples: 1,
+    maxProbeCount: 4096,
+    detailVolumeEnabled: false,
+  } satisfies Partial<BakeSettings>)
 }
-
-const SHADOW_MASK_RESOLUTIONS = Object.values(SHADOW_MASK_RESOLUTION_OPTIONS)
 
 type BakeLightRuntime = {
   config: BakeLightConfig
@@ -126,7 +160,8 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           <p>
             This page loads the Sponza model and generates a regular-grid IrradianceVolume
             asset. WebGPU mode jointly bakes adjustable Babylon physical PointLights into
-            a single .ivpack bundle with base/detail irradiance volumes and static shadowmask data.
+            a compact .ivpack bundle using the same L0/L1 layout as VRCLightVolumes.
+            The optional detail volume increases density near scene geometry.
           </p>
         </section>
 
@@ -152,6 +187,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           <h2>Output</h2>
           <ol>
             <li id="summaryLine">Waiting for Sponza.</li>
+            <li id="estimateLine">Volume estimate is not available yet.</li>
             <li>Bundle asset name: <code>sponza-irradiance-bake.ivpack</code></li>
             <li>Use the downloaded .ivpack file in the validation page.</li>
           </ol>
@@ -166,6 +202,7 @@ const status = mustQuery<HTMLDivElement>('#status')
 const probeCount = mustQuery<HTMLSpanElement>('#probeCount')
 const volumeState = mustQuery<HTMLSpanElement>('#volumeState')
 const summaryLine = mustQuery<HTMLLIElement>('#summaryLine')
+const estimateLine = mustQuery<HTMLLIElement>('#estimateLine')
 const tweakpaneHost = mustQuery<HTMLDivElement>('#tweakpaneHost')
 const bakeButton = mustQuery<HTMLButtonElement>('#bakeVolume')
 const downloadButton = mustQuery<HTMLButtonElement>('#downloadVolume')
@@ -188,7 +225,6 @@ const setBakeProgress = (percent: number, message: string): void => {
 
 let latestBinary: ArrayBuffer | null = null
 let latestDetailBinary: ArrayBuffer | null = null
-let latestShadowMaskBinary: ArrayBuffer | null = null
 let latestBundleBinary: ArrayBuffer | null = null
 let probeMeshes: Mesh[] = []
 let probeMaterials: StandardMaterial[] = []
@@ -197,23 +233,37 @@ let lightRuntimes: BakeLightRuntime[] = []
 let lightGizmo: GizmoManager | null = null
 let pane: Pane | null = null
 let activeScene: Scene | null = null
+let activeVolumeBounds: IrradianceVolumeGrid['bounds'] | null = null
+let activeGeometry: AbstractMesh[] = []
 let hasGeneratedBake = false
 
 try {
   const app = await createSponzaApp(canvas, setStatus, true, true)
   activeScene = app.scene
   const volumeBounds = volumeBoundsFromScene(app.bounds)
+  activeVolumeBounds = volumeBounds
+  activeGeometry = app.importedMeshes
   createBoundsMesh(volumeBounds)
   createBakeLights(app)
+  configureBakeHdrPreview(app.scene)
   createBakePane(app)
+  updateBakeEstimate()
   setBakeProgress(0, 'Waiting for bake.')
 
-  app.engine.runRenderLoop(() => {
-    if (lightGizmo?.isDragging) {
-      syncSelectedLightFromGizmo()
+  const renderFrame = (): void => {
+    try {
+      if (lightGizmo?.isDragging) {
+        syncSelectedLightFromGizmo()
+      }
+      app.scene.imageProcessingConfiguration.exposure = 2 ** settings.previewExposureEv
+      app.scene.render()
+    } catch (error) {
+      app.engine.stopRenderLoop(renderFrame)
+      setStatus(`WebGPU preview render failed: ${(error as Error).message}`, true)
     }
-    app.scene.render()
-  })
+  }
+
+  app.engine.runRenderLoop(renderFrame)
 
   bakeButton.disabled = false
   summaryLine.textContent =
@@ -250,7 +300,7 @@ try {
 
 async function bakeWebGPU(
   app: Awaited<ReturnType<typeof createSponzaApp>>,
-  bounds: IrradianceVolumeData['bounds'],
+  bounds: IrradianceVolumeGrid['bounds'],
 ): Promise<void> {
   sanitizeBakeSettings()
   syncAllBakeLights()
@@ -259,35 +309,36 @@ async function bakeWebGPU(
   latestBundleBinary = null
   latestBinary = null
   latestDetailBinary = null
-  latestShadowMaskBinary = null
   disposeProbeMeshes()
   const enabledLights = getEnabledLightRuntimes()
 
-  const requestedResolution: Vec3Tuple = [
-    settings.resolutionX,
-    settings.resolutionY,
-    settings.resolutionZ,
-  ]
-  const resolution = fitResolutionToProbeBudget(requestedResolution, getBaseProbeBudget())
-  const requestedProbeCount = requestedResolution[0] * requestedResolution[1] * requestedResolution[2]
+  const resolution = calculateVolumeResolution(bounds)
   const actualProbeCount = resolution[0] * resolution[1] * resolution[2]
-  const detailBounds = createDetailVolumeBounds(bounds, app.importedMeshes)
-  const detailResolution = fitDetailResolutionToProbeBudget(
-    requestedResolution,
-    bounds,
-    detailBounds,
-    getDetailProbeBudget(),
-  )
-  const detailProbeCount = detailResolution[0] * detailResolution[1] * detailResolution[2]
+  const detailBounds = settings.detailVolumeEnabled
+    ? createDetailVolumeBounds(bounds, app.importedMeshes)
+    : null
+  const detailResolution = detailBounds
+    ? calculateDetailVolumeResolution(bounds, detailBounds, resolution)
+    : null
+  const detailProbeCount = detailResolution
+    ? detailResolution[0] * detailResolution[1] * detailResolution[2]
+    : 0
 
   setStatus('WebGPU baking physical Babylon lights...')
   volumeState.textContent = 'WebGPU baking...'
-  probeCount.textContent = `${actualProbeCount} base + ${detailProbeCount} detail probes`
+  probeCount.textContent = detailResolution
+    ? `${actualProbeCount} base + ${detailProbeCount} detail probes`
+    : `${actualProbeCount} probes`
   setBakeProgress(8, 'Preparing WebGPU buffers.')
 
   try {
     if (enabledLights.length === 0) {
       throw new Error('Enable at least one point light before baking.')
+    }
+    if (actualProbeCount + detailProbeCount > settings.maxProbeCount) {
+      throw new Error(
+        `Requested ${actualProbeCount + detailProbeCount} probes exceeds the safety budget ${settings.maxProbeCount}. Lower Voxels Per Unit/resolution, disable the detail volume, or raise the budget.`,
+      )
     }
 
     const result = await bakeIrradianceVolumeWebGPU({
@@ -296,38 +347,56 @@ async function bakeWebGPU(
       resolution,
       lights: enabledLights.map((runtime) => runtime.light),
       geometry: app.importedMeshes,
-      exposure: settings.exposure,
-      bounces: settings.bounces,
-      areaSamples: settings.areaSamples,
-      bounceRayCount: settings.bounceRayCount,
-      accumulationSamples: settings.accumulationSamples,
-      onProgress: setBakeProgress,
-    })
-    setBakeProgress(88, 'Base IVOL payload ready. Baking detail volume.')
-    const detailResult = await bakeIrradianceVolumeWebGPU({
-      engine: app.engine,
-      bounds: detailBounds,
-      resolution: detailResolution,
-      lights: enabledLights.map((runtime) => runtime.light),
-      geometry: app.importedMeshes,
-      exposure: settings.exposure,
+      exposureEv: settings.exposure,
+      shadows: settings.shadows,
+      highlights: settings.highlights,
+      denoise: settings.denoise,
+      dilateInvalidProbes: settings.dilateInvalidProbes,
+      dilationIterations: settings.dilationIterations,
+      dilationBackfaceBias: settings.dilationBackfaceBias,
+      relocateProbes: settings.relocateProbes,
+      pointLightShadows: settings.pointLightShadows,
       bounces: settings.bounces,
       areaSamples: settings.areaSamples,
       bounceRayCount: settings.bounceRayCount,
       accumulationSamples: settings.accumulationSamples,
       onProgress: (percent, message) => {
-        setBakeProgress(88 + percent * 0.08, `Detail volume: ${message}`)
+        const progressEnd = detailResolution ? 86 : 96
+        setBakeProgress(8 + percent * ((progressEnd - 8) / 100), `Base volume: ${message}`)
       },
     })
-    setBakeProgress(96, 'Base and detail IVOL payloads ready.')
+    const detailResult = detailBounds && detailResolution
+      ? await bakeIrradianceVolumeWebGPU({
+        engine: app.engine,
+        bounds: detailBounds,
+        resolution: detailResolution,
+        lights: enabledLights.map((runtime) => runtime.light),
+        geometry: app.importedMeshes,
+        exposureEv: settings.exposure,
+        shadows: settings.shadows,
+        highlights: settings.highlights,
+        denoise: settings.denoise,
+        dilateInvalidProbes: settings.dilateInvalidProbes,
+        dilationIterations: settings.dilationIterations,
+        dilationBackfaceBias: settings.dilationBackfaceBias,
+        relocateProbes: settings.relocateProbes,
+        pointLightShadows: settings.pointLightShadows,
+        bounces: settings.bounces,
+        areaSamples: settings.areaSamples,
+        bounceRayCount: settings.bounceRayCount,
+        accumulationSamples: settings.accumulationSamples,
+        onProgress: (percent, message) => {
+          setBakeProgress(86 + percent * 0.1, `Detail volume: ${message}`)
+        },
+      })
+      : null
+    setBakeProgress(96, detailResult ? 'Base and detail IVOL payloads ready.' : 'IVOL payload ready.')
     latestBinary = result.binary
-    latestDetailBinary = detailResult.binary
-    setBakeProgress(96, 'Baking paired static shadowmask.')
-    latestShadowMaskBinary = await bakePairedShadowMask(app, bounds, enabledLights.map((runtime) => runtime.config))
+    latestDetailBinary = detailResult?.binary ?? null
+    setBakeProgress(96, 'Packing compact L1 volume bundle.')
     latestBundleBinary = createIrradianceBakeBundle(
       latestBinary,
       latestDetailBinary,
-      latestShadowMaskBinary,
     )
     hasGeneratedBake = true
 
@@ -339,44 +408,22 @@ async function bakeWebGPU(
     volumeState.textContent = 'Ready to download .ivpack'
     summaryLine.textContent =
       `Generated ${irradianceBakeBundleSummary(parsedBundle)} from ${enabledLights.length} light(s) at ${new Date().toLocaleTimeString()}. ${irradianceBakeBundleQualitySummary(parsedBundle)}.`
-    if (actualProbeCount < requestedProbeCount) {
-      summaryLine.textContent += ` Requested ${requestedResolution.join(' x ')} was budgeted to ${resolution.join(' x ')}.`
-    }
+    summaryLine.textContent += settings.adaptiveResolution
+      ? ` Adaptive density ${settings.voxelsPerUnit.toFixed(2)} voxels/m.`
+      : ` Manual resolution ${resolution.join(' x ')}.`
     downloadButton.disabled = false
-    autoDownloadLatestBake()
-    setBakeProgress(100, 'Bake complete. The .ivpack asset was downloaded automatically.')
+    setBakeProgress(100, 'Bake complete. Review the summary, then download the .ivpack asset.')
   } catch (error) {
     setStatus(`WebGPU bake failed: ${(error as Error).message}`, true)
+    volumeState.textContent = 'Bake failed'
+    downloadButton.disabled = true
     setBakeProgress(0, 'Bake failed.')
   } finally {
     bakeButton.disabled = false
   }
 }
 
-async function bakePairedShadowMask(
-  app: Pick<Awaited<ReturnType<typeof createSponzaApp>>, 'scene' | 'importedMeshes'>,
-  bounds: IrradianceVolumeData['bounds'],
-  enabledLights: BakeLightConfig[],
-): Promise<ArrayBuffer> {
-  const start = performance.now()
-  const binary = await bakeStaticShadowMask({
-    scene: app.scene,
-    bounds,
-    geometry: app.importedMeshes,
-    lights: enabledLights,
-    resolution: settings.shadowMaskResolution,
-    onProgress: (percent, message) => {
-      setBakeProgress(96 + percent * 0.02, message)
-    },
-  })
-  const elapsed = ((performance.now() - start) / 1000).toFixed(1)
-
-  setStatus(`Static shadowmask baked in ${elapsed}s.`)
-
-  return binary
-}
-
-function createBoundsMesh(bounds: IrradianceVolumeData['bounds']): void {
+function createBoundsMesh(bounds: IrradianceVolumeGrid['bounds']): void {
   if (!activeScene) {
     return
   }
@@ -493,30 +540,62 @@ function createBakePane(app: Awaited<ReturnType<typeof createSponzaApp>>): void 
     container: tweakpaneHost,
   })
 
-  const gridFolder = pane.addFolder({ title: 'Volume Grid' })
-  gridFolder.addBinding(settings, 'resolutionX', { label: 'X probes', min: 3, max: 96, step: 1 })
+  const gridFolder = pane.addFolder({ title: 'Light Volume' })
+  gridFolder.addBinding(settings, 'adaptiveResolution', { label: 'Adaptive resolution' })
     .on('change', () => handleBakeSettingsChanged())
-  gridFolder.addBinding(settings, 'resolutionY', { label: 'Y probes', min: 2, max: 48, step: 1 })
+  gridFolder.addBinding(settings, 'voxelsPerUnit', { label: 'Voxels per meter', min: 0.25, max: 8, step: 0.25 })
     .on('change', () => handleBakeSettingsChanged())
-  gridFolder.addBinding(settings, 'resolutionZ', { label: 'Z probes', min: 3, max: 96, step: 1 })
+  gridFolder.addBinding(settings, 'resolutionX', { label: 'Manual X', min: 2, max: 96, step: 1 })
     .on('change', () => handleBakeSettingsChanged())
-  gridFolder.addBinding(settings, 'bounces', { label: 'Bounces', min: 0, max: 16, step: 1 })
+  gridFolder.addBinding(settings, 'resolutionY', { label: 'Manual Y', min: 2, max: 48, step: 1 })
     .on('change', () => handleBakeSettingsChanged())
-  gridFolder.addBinding(settings, 'bounceRayCount', { label: 'Bounce rays', min: 1, max: 8, step: 1 })
+  gridFolder.addBinding(settings, 'resolutionZ', { label: 'Manual Z', min: 2, max: 96, step: 1 })
     .on('change', () => handleBakeSettingsChanged())
-  gridFolder.addBinding(settings, 'areaSamples', { label: 'Area samples', min: 1, max: 8, step: 1 })
+  gridFolder.addBinding(settings, 'detailVolumeEnabled', { label: 'Additional detail volume' })
     .on('change', () => handleBakeSettingsChanged())
-  gridFolder.addBinding(settings, 'accumulationSamples', { label: 'Accum samples', min: 1, max: 64, step: 1 })
+  gridFolder.addBinding(settings, 'detailDensityMultiplier', { label: 'Detail density multiplier', min: 1, max: 3, step: 0.25 })
     .on('change', () => handleBakeSettingsChanged())
-  gridFolder.addBinding(settings, 'exposure', { label: 'Exposure', min: 0.2, max: 3, step: 0.05 })
+  gridFolder.addBinding(settings, 'maxProbeCount', { label: 'Safety probe budget', min: 4096, max: 1048576, step: 4096 })
     .on('change', () => handleBakeSettingsChanged())
-  gridFolder.addBinding(settings, 'maxProbeCount', { label: 'Probe budget', min: 4096, max: 1048576, step: 16384 })
+
+  const probeFolder = pane.addFolder({ title: 'Probe Processing' })
+  probeFolder.addBinding(settings, 'denoise', { label: 'Denoise' })
     .on('change', () => handleBakeSettingsChanged())
-  gridFolder.addBinding(settings, 'shadowMaskResolution', {
-    label: 'Shadowmask px',
-    options: SHADOW_MASK_RESOLUTION_OPTIONS,
-  })
+  probeFolder.addBinding(settings, 'dilateInvalidProbes', { label: 'Dilate invalid probes' })
     .on('change', () => handleBakeSettingsChanged())
+  probeFolder.addBinding(settings, 'dilationIterations', { label: 'Dilation iterations', min: 1, max: 8, step: 1 })
+    .on('change', () => handleBakeSettingsChanged())
+  probeFolder.addBinding(settings, 'dilationBackfaceBias', { label: 'Backface bias', min: 0, max: 1, step: 0.01 })
+    .on('change', () => handleBakeSettingsChanged())
+  probeFolder.addBinding(settings, 'relocateProbes', { label: 'Relocate probes' })
+    .on('change', () => handleBakeSettingsChanged())
+
+  const qualityFolder = pane.addFolder({ title: 'WebGPU Trace Quality' })
+  qualityFolder.addBinding(settings, 'pointLightShadows', { label: 'Point light shadows' })
+    .on('change', () => handleBakeSettingsChanged())
+  qualityFolder.addBinding(settings, 'bounces', { label: 'Indirect bounces', min: 0, max: 16, step: 1 })
+    .on('change', () => handleBakeSettingsChanged())
+  qualityFolder.addBinding(settings, 'bounceRayCount', { label: 'Bounce rays', min: 1, max: 8, step: 1 })
+    .on('change', () => handleBakeSettingsChanged())
+  qualityFolder.addBinding(settings, 'areaSamples', { label: 'Soft shadow samples', min: 1, max: 8, step: 1 })
+    .on('change', () => handleBakeSettingsChanged())
+  qualityFolder.addBinding(settings, 'accumulationSamples', { label: 'Accumulation samples', min: 1, max: 64, step: 1 })
+    .on('change', () => handleBakeSettingsChanged())
+
+  const colorFolder = pane.addFolder({ title: 'Color Correction' })
+  colorFolder.addBinding(settings, 'exposure', { label: 'Exposure EV', min: -8, max: 8, step: 0.25 })
+    .on('change', () => handleBakeSettingsChanged())
+  colorFolder.addBinding(settings, 'shadows', { label: 'Shadows', min: -1, max: 1, step: 0.05 })
+    .on('change', () => handleBakeSettingsChanged())
+  colorFolder.addBinding(settings, 'highlights', { label: 'Highlights', min: -1, max: 1, step: 0.05 })
+    .on('change', () => handleBakeSettingsChanged())
+
+  const displayFolder = pane.addFolder({ title: 'HDR Preview' })
+  displayFolder.addBinding(settings, 'previewExposureEv', { label: 'Display exposure EV', min: -4, max: 4, step: 0.25 })
+    .on('change', () => {
+      settings.previewExposureEv = clampNumber(settings.previewExposureEv, -4, 4)
+      pane?.refresh()
+    })
 
   const lightFolder = pane.addFolder({ title: `Point Lights (${lightConfigs.length}/${MAX_BAKE_LIGHTS})` })
   lightFolder.addBinding(lightSelection, 'selectedLightId', {
@@ -567,6 +646,7 @@ function createSelectedLightPane(parent: PaneFolder): void {
 function handleBakeSettingsChanged(): void {
   sanitizeBakeSettings()
   pane?.refresh()
+  updateBakeEstimate()
   markBakeDirty()
 }
 
@@ -705,7 +785,9 @@ function updateLightDebugSelection(): void {
     const selected = runtime.config.id === lightSelection.selectedLightId
 
     runtime.marker.scaling.setAll(Math.max(0.18, runtime.config.sourceRadius) * (selected ? 1.35 : 1))
-    runtime.radiusMesh.isVisible = runtime.config.enabled || selected
+    // Showing every enabled range sphere covers the viewport with overlapping
+    // wireframes. Keep only the selected light's authoring radius visible.
+    runtime.radiusMesh.isVisible = selected
     runtime.radiusMaterial.alpha = selected ? 0.34 : 0.16
   }
 }
@@ -810,76 +892,115 @@ function disposeProbeMeshes(): void {
   probeMaterials = []
 }
 
+function updateBakeEstimate(): void {
+  if (!activeVolumeBounds) {
+    return
+  }
+
+  const baseResolution = calculateVolumeResolution(activeVolumeBounds)
+  const baseCount = baseResolution[0] * baseResolution[1] * baseResolution[2]
+  const detailBounds = settings.detailVolumeEnabled
+    ? createDetailVolumeBounds(activeVolumeBounds, activeGeometry)
+    : null
+  const detailResolution = detailBounds
+    ? calculateDetailVolumeResolution(activeVolumeBounds, detailBounds, baseResolution)
+    : null
+  const detailCount = detailResolution
+    ? detailResolution[0] * detailResolution[1] * detailResolution[2]
+    : 0
+  const totalCount = baseCount + detailCount
+  const ivolBytes = totalCount * 12 * Float32Array.BYTES_PER_ELEMENT + (detailResolution ? 2 : 1) * 96
+  const scratchBytes = totalCount * 20 * Float32Array.BYTES_PER_ELEMENT
+  const mode = settings.adaptiveResolution
+    ? `${settings.voxelsPerUnit.toFixed(2)} voxels/m`
+    : 'manual'
+  const detailText = detailResolution ? ` + detail ${detailResolution.join(' x ')}` : ''
+  const budgetState = totalCount > settings.maxProbeCount
+    ? ` Exceeds safety budget by ${totalCount - settings.maxProbeCount} probes.`
+    : ''
+
+  estimateLine.textContent = `${mode}: base ${baseResolution.join(' x ')}${detailText}; ${totalCount.toLocaleString()} probes, ${(ivolBytes / 1048576).toFixed(1)} MiB asset payload, ${(scratchBytes / 1048576).toFixed(1)} MiB GPU probe scratch.${budgetState}`
+  estimateLine.dataset.state = totalCount > settings.maxProbeCount ? 'error' : 'ready'
+}
+
 function sanitizeBakeSettings(): void {
-  settings.resolutionX = clampInteger(settings.resolutionX, 3, 96)
+  settings.voxelsPerUnit = clampNumber(settings.voxelsPerUnit, 0.25, 8)
+  settings.resolutionX = clampInteger(settings.resolutionX, 2, 96)
   settings.resolutionY = clampInteger(settings.resolutionY, 2, 48)
-  settings.resolutionZ = clampInteger(settings.resolutionZ, 3, 96)
+  settings.resolutionZ = clampInteger(settings.resolutionZ, 2, 96)
+  settings.dilationIterations = clampInteger(settings.dilationIterations, 1, 8)
+  settings.dilationBackfaceBias = clampNumber(settings.dilationBackfaceBias, 0, 1)
   settings.bounces = clampInteger(settings.bounces, 0, 16)
   settings.bounceRayCount = clampInteger(settings.bounceRayCount, 1, 8)
   settings.areaSamples = clampInteger(settings.areaSamples, 1, 8)
   settings.accumulationSamples = clampInteger(settings.accumulationSamples, 1, 64)
-  settings.exposure = clampNumber(settings.exposure, 0.2, 3)
+  settings.exposure = clampNumber(settings.exposure, -8, 8)
+  settings.shadows = clampNumber(settings.shadows, -1, 1)
+  settings.highlights = clampNumber(settings.highlights, -1, 1)
+  settings.previewExposureEv = clampNumber(settings.previewExposureEv, -4, 4)
   settings.maxProbeCount = clampInteger(settings.maxProbeCount, 4096, 1048576)
-  settings.shadowMaskResolution = getClosestShadowMaskResolution(settings.shadowMaskResolution)
+  settings.detailDensityMultiplier = clampNumber(settings.detailDensityMultiplier, 1, 3)
 }
 
-function fitResolutionToProbeBudget(resolution: Vec3Tuple, maxProbeCount: number): Vec3Tuple {
-  const sanitized: Vec3Tuple = [
-    clampInteger(resolution[0], 3, 96),
-    clampInteger(resolution[1], 2, 48),
-    clampInteger(resolution[2], 3, 96),
-  ]
-  const requested = sanitized[0] * sanitized[1] * sanitized[2]
-  const budget = Math.max(1, Math.floor(maxProbeCount))
+function configureBakeHdrPreview(scene: Scene): void {
+  const imageProcessing = scene.imageProcessingConfiguration
 
-  if (requested <= budget) {
-    return sanitized
-  }
-
-  const scale = Math.cbrt(budget / requested)
-  let fitted: Vec3Tuple = [
-    Math.max(3, Math.floor(sanitized[0] * scale)),
-    Math.max(2, Math.floor(sanitized[1] * scale)),
-    Math.max(3, Math.floor(sanitized[2] * scale)),
-  ]
-
-  while (fitted[0] * fitted[1] * fitted[2] > budget) {
-    const axis = getLargestResolutionAxis(fitted)
-    fitted[axis] = Math.max(axis === 1 ? 2 : 3, fitted[axis] - 1)
-  }
-
-  return fitted
+  imageProcessing.toneMappingEnabled = true
+  imageProcessing.toneMappingType = ImageProcessingConfiguration.TONEMAPPING_ACES
+  imageProcessing.exposure = 2 ** settings.previewExposureEv
+  imageProcessing.contrast = 1
+  imageProcessing.ditheringEnabled = true
+  imageProcessing.ditheringIntensity = 1 / 255
 }
 
-function fitDetailResolutionToProbeBudget(
-  requestedResolution: Vec3Tuple,
-  sceneBounds: IrradianceVolumeData['bounds'],
-  detailBounds: IrradianceVolumeData['bounds'],
-  maxProbeCount: number,
+function calculateVolumeResolution(
+  bounds: IrradianceVolumeGrid['bounds'],
 ): Vec3Tuple {
+  if (settings.adaptiveResolution) {
+    return calculateAdaptiveResolution(bounds, settings.voxelsPerUnit)
+  }
+
+  return [settings.resolutionX, settings.resolutionY, settings.resolutionZ]
+}
+
+function calculateDetailVolumeResolution(
+  sceneBounds: IrradianceVolumeGrid['bounds'],
+  detailBounds: IrradianceVolumeGrid['bounds'],
+  baseResolution: Vec3Tuple,
+): Vec3Tuple {
+  if (settings.adaptiveResolution) {
+    return calculateAdaptiveResolution(
+      detailBounds,
+      settings.voxelsPerUnit * settings.detailDensityMultiplier,
+    )
+  }
+
   const sceneSize = boundsSize(sceneBounds)
   const detailSize = boundsSize(detailBounds)
-  const boosted: Vec3Tuple = [
-    boostResolutionAxis(requestedResolution[0], sceneSize.x, detailSize.x, 3, 96),
-    boostResolutionAxis(requestedResolution[1], sceneSize.y, detailSize.y, 2, 48),
-    boostResolutionAxis(requestedResolution[2], sceneSize.z, detailSize.z, 3, 96),
+  return [
+    boostResolutionAxis(baseResolution[0], sceneSize.x, detailSize.x, 2, 96),
+    boostResolutionAxis(baseResolution[1], sceneSize.y, detailSize.y, 2, 48),
+    boostResolutionAxis(baseResolution[2], sceneSize.z, detailSize.z, 2, 96),
   ]
-
-  return fitResolutionToProbeBudget(boosted, maxProbeCount)
 }
 
-function getBaseProbeBudget(): number {
-  return Math.max(4096, Math.floor(settings.maxProbeCount * 0.38))
-}
+function calculateAdaptiveResolution(
+  bounds: IrradianceVolumeGrid['bounds'],
+  voxelsPerUnit: number,
+): Vec3Tuple {
+  const size = boundsSize(bounds)
 
-function getDetailProbeBudget(): number {
-  return Math.max(4096, settings.maxProbeCount - getBaseProbeBudget())
+  return [
+    clampInteger(Math.round(size.x * voxelsPerUnit), 2, 96),
+    clampInteger(Math.round(size.y * voxelsPerUnit), 2, 48),
+    clampInteger(Math.round(size.z * voxelsPerUnit), 2, 96),
+  ]
 }
 
 function createDetailVolumeBounds(
-  bounds: IrradianceVolumeData['bounds'],
+  bounds: IrradianceVolumeGrid['bounds'],
   meshes: AbstractMesh[],
-): IrradianceVolumeData['bounds'] {
+): IrradianceVolumeGrid['bounds'] {
   const min = new Vector3(bounds.min[0], bounds.min[1], bounds.min[2])
   const max = new Vector3(bounds.max[0], bounds.max[1], bounds.max[2])
   const size = max.subtract(min)
@@ -900,9 +1021,9 @@ function createDetailVolumeBounds(
 }
 
 function createGeometryDensityBounds(
-  bounds: IrradianceVolumeData['bounds'],
+  bounds: IrradianceVolumeGrid['bounds'],
   meshes: AbstractMesh[],
-): IrradianceVolumeData['bounds'] | null {
+): IrradianceVolumeGrid['bounds'] | null {
   const sceneMin = new Vector3(bounds.min[0], bounds.min[1], bounds.min[2])
   const sceneMax = new Vector3(bounds.max[0], bounds.max[1], bounds.max[2])
   const sceneSize = sceneMax.subtract(sceneMin)
@@ -973,7 +1094,7 @@ function ensureMinimumBoundsSize(min: Vector3, max: Vector3, sceneMin: Vector3, 
   }
 }
 
-function boundsSize(bounds: IrradianceVolumeData['bounds']): Vector3 {
+function boundsSize(bounds: IrradianceVolumeGrid['bounds']): Vector3 {
   return new Vector3(
     Math.max(0.001, bounds.max[0] - bounds.min[0]),
     Math.max(0.001, bounds.max[1] - bounds.min[1]),
@@ -985,25 +1106,6 @@ function boostResolutionAxis(value: number, sceneSize: number, detailSize: numbe
   const densityBoost = Math.sqrt(Math.max(1, sceneSize / Math.max(detailSize, 0.001)))
 
   return clampInteger(Math.round(value * Math.min(densityBoost, 1.85)), min, max)
-}
-
-function getLargestResolutionAxis(resolution: Vec3Tuple): 0 | 1 | 2 {
-  if (resolution[1] >= resolution[0] && resolution[1] >= resolution[2]) {
-    return 1
-  }
-
-  return resolution[0] >= resolution[2] ? 0 : 2
-}
-
-function getClosestShadowMaskResolution(value: number): number {
-  const requested = Number.isFinite(value) ? value : SHADOW_MASK_RESOLUTIONS[0]
-
-  return SHADOW_MASK_RESOLUTIONS.reduce((closest, candidate) => {
-    const closestDistance = Math.abs(closest - requested)
-    const candidateDistance = Math.abs(candidate - requested)
-
-    return candidateDistance < closestDistance ? candidate : closest
-  }, SHADOW_MASK_RESOLUTIONS[0])
 }
 
 function sanitizeLightConfig(config: BakeLightConfig): void {
@@ -1041,12 +1143,6 @@ function downloadBundle(buffer: ArrayBuffer): void {
   link.download = 'sponza-irradiance-bake.ivpack'
   link.click()
   window.setTimeout(() => URL.revokeObjectURL(url), 30_000)
-}
-
-function autoDownloadLatestBake(): void {
-  if (latestBundleBinary) {
-    downloadBundle(latestBundleBinary)
-  }
 }
 
 function mustQuery<T extends Element>(selector: string): T {

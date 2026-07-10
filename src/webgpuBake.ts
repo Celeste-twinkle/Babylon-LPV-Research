@@ -1,7 +1,6 @@
-import '@babylonjs/core/Engines/WebGPU/Extensions/engine.computeShader'
-
 import type { AbstractMesh } from '@babylonjs/core/Meshes/abstractMesh'
 import type { AbstractEngine } from '@babylonjs/core/Engines/abstractEngine'
+import type { BaseTexture } from '@babylonjs/core/Materials/Textures/baseTexture'
 import type { Light } from '@babylonjs/core/Lights/light'
 import { ComputeShader } from '@babylonjs/core/Compute/computeShader'
 import { Constants } from '@babylonjs/core/Engines/constants'
@@ -13,21 +12,32 @@ import { StorageBuffer } from '@babylonjs/core/Buffers/storageBuffer'
 import { VertexBuffer } from '@babylonjs/core/Buffers/buffer'
 import { Vector3 } from '@babylonjs/core/Maths/math.vector'
 import type { WebGPUEngine } from '@babylonjs/core/Engines/webgpuEngine'
+import { RegisterEnginesWebGPUExtensionsEngineComputeShader } from '@babylonjs/core/Engines/WebGPU/Extensions/engine.computeShader.pure'
 
-import type { IrradianceVolumeData, Vec3Tuple } from './irradianceVolume'
+import type { IrradianceVolumeGrid, Vec3Tuple } from './irradianceVolume'
 import {
   IVOL_PROBE_STRIDE_FLOATS,
   IVOL_HEADER_BYTES,
   createIvolBinary,
 } from './irradianceVolume'
 
+RegisterEnginesWebGPUExtensionsEngineComputeShader()
+
 export type WebGPUBakeInput = {
   engine: AbstractEngine
-  bounds: IrradianceVolumeData['bounds']
+  bounds: IrradianceVolumeGrid['bounds']
   resolution: Vec3Tuple
   lights: Light[]
   geometry: AbstractMesh[]
-  exposure: number
+  exposureEv: number
+  shadows?: number
+  highlights?: number
+  denoise?: boolean
+  dilateInvalidProbes?: boolean
+  dilationIterations?: number
+  dilationBackfaceBias?: number
+  relocateProbes?: boolean
+  pointLightShadows?: boolean
   bounces: number
   areaSamples?: number
   bounceRayCount?: number
@@ -43,11 +53,12 @@ export type WebGPUBakeResult = {
 
 const MAX_LIGHTS = 8
 const LIGHT_STRIDE_FLOATS = 16
+const WEBGPU_BAKE_PROBE_STRIDE_FLOATS = 20
 const TRIANGLE_STRIDE_FLOATS = 16
 const BVH_NODE_STRIDE_FLOATS = 12
 const BVH_LEAF_SIZE = 8
-const MAX_DISPATCH_PROBE_SLICE_SIZE = 32
-const MAX_DISPATCH_RAY_WORK_ESTIMATE = 8192
+const MAX_DISPATCH_PROBE_SLICE_SIZE = 1024
+const MAX_DISPATCH_RAY_WORK_ESTIMATE = 262144
 const PROBE_VISIBILITY_RAY_COUNT_ESTIMATE = 8
 const PROBE_RELOCATION_RAY_COUNT_ESTIMATE = 12
 const READBACK_CHUNK_BYTES = 16 * 1024 * 1024
@@ -75,7 +86,7 @@ export const bakeIrradianceVolumeWebGPU = async (
   const dispatchSliceSize = chooseDispatchProbeSliceSize(probeCount, rayWorkEstimate)
   const dispatchSliceCount = Math.ceil(probeCount / dispatchSliceSize)
   const accumulationSamples = clampInteger(input.accumulationSamples ?? 1, 1, 64)
-  const payloadBytes = probeCount * IVOL_PROBE_STRIDE_FLOATS * Float32Array.BYTES_PER_ELEMENT
+  const payloadBytes = probeCount * WEBGPU_BAKE_PROBE_STRIDE_FLOATS * Float32Array.BYTES_PER_ELEMENT
   const params = createParams(input)
   const lightData = createLightBuffer(input.lights)
   const report = (percent: number, message: string): void => {
@@ -83,7 +94,7 @@ export const bakeIrradianceVolumeWebGPU = async (
   }
 
   report(10, 'Building static mesh BVH for ray occlusion.')
-  const geometryData = createGeometryBuffers(input.geometry)
+  const geometryData = await createGeometryBuffers(input.geometry)
   params[14] = geometryData.triangleCount
   params[15] = geometryData.nodeCount
   params[16] = computeMaxRayDistance(input.bounds)
@@ -203,13 +214,37 @@ export const bakeIrradianceVolumeWebGPU = async (
       'Timed out while reading the WebGPU irradiance payload.',
     )
 
-    report(93, 'Denoising SH payload with visibility-aware neighbor filtering.')
-    payload = denoiseIvolPayload(input.resolution, payload)
+    if (input.dilateInvalidProbes ?? true) {
+      const dilationIterations = clampInteger(input.dilationIterations ?? 1, 1, 8)
+      report(92, `Dilating invalid probes (${dilationIterations} iteration(s)).`)
+      payload = dilateInvalidIvolPayload(
+        input.resolution,
+        payload,
+        dilationIterations,
+        clamp01(input.dilationBackfaceBias ?? 0.1),
+      )
+    }
+
+    if (input.denoise ?? true) {
+      report(93, 'Denoising SH payload with visibility-aware neighbor filtering.')
+      payload = denoiseIvolPayload(input.resolution, payload)
+    }
 
     report(94, 'Constraining SH coefficients and dominant light energy.')
     payload = constrainIvolPayloadSh(payload)
 
-    report(95, 'Packing binary .ivol payload.')
+    report(94.5, 'Compacting convolved L1 SH payload.')
+    payload = compactIvolPayload(payload)
+
+    report(95, 'Applying VRCLightVolumes color correction.')
+    payload = colorCorrectIvolPayload(
+      payload,
+      input.exposureEv,
+      input.shadows ?? 0,
+      input.highlights ?? 0,
+    )
+
+    report(96, 'Packing binary .ivol payload.')
     const binary = createIvolBinary(input, payload)
 
     return {
@@ -493,6 +528,75 @@ const estimateRayWorkPerProbe = (input: WebGPUBakeInput): number => {
 const clampInteger = (value: number, min: number, max: number): number =>
   Math.min(max, Math.max(min, Math.round(value)))
 
+const dilateInvalidIvolPayload = (
+  resolution: Vec3Tuple,
+  payload: Float32Array,
+  iterations: number,
+  backfaceBias: number,
+): Float32Array => {
+  const [rx, ry, rz] = resolution
+  let source = new Float32Array(payload)
+
+  for (let iteration = 0; iteration < iterations; iteration += 1) {
+    const output = new Float32Array(source)
+
+    for (let z = 0; z < rz; z += 1) {
+      for (let y = 0; y < ry; y += 1) {
+        for (let x = 0; x < rx; x += 1) {
+          const base = getPayloadProbeIndex(x, y, z, resolution) * WEBGPU_BAKE_PROBE_STRIDE_FLOATS
+          if (source[base + 19] < backfaceBias) {
+            continue
+          }
+
+          const sums = new Float32Array(15)
+          let validNeighbors = 0
+          for (let dz = -1; dz <= 1; dz += 1) {
+            for (let dy = -1; dy <= 1; dy += 1) {
+              for (let dx = -1; dx <= 1; dx += 1) {
+                const nx = x + dx
+                const ny = y + dy
+                const nz = z + dz
+                if (nx < 0 || ny < 0 || nz < 0 || nx >= rx || ny >= ry || nz >= rz) {
+                  continue
+                }
+
+                const neighborBase = getPayloadProbeIndex(nx, ny, nz, resolution) * WEBGPU_BAKE_PROBE_STRIDE_FLOATS
+                if (source[neighborBase + 19] >= backfaceBias) {
+                  continue
+                }
+
+                for (let channel = 0; channel < 12; channel += 1) {
+                  sums[channel] += source[neighborBase + channel]
+                }
+                sums[12] += source[neighborBase + 13]
+                sums[13] += source[neighborBase + 14]
+                sums[14] += source[neighborBase + 18]
+                validNeighbors += 1
+              }
+            }
+          }
+
+          if (validNeighbors === 0) {
+            continue
+          }
+
+          for (let channel = 0; channel < 12; channel += 1) {
+            output[base + channel] = sums[channel] / validNeighbors
+          }
+          output[base + 13] = sums[12] / validNeighbors
+          output[base + 14] = sums[13] / validNeighbors
+          output[base + 18] = sums[14] / validNeighbors
+          output[base + 19] = 0
+        }
+      }
+    }
+
+    source = output
+  }
+
+  return source
+}
+
 const denoiseIvolPayload = (resolution: Vec3Tuple, payload: Float32Array): Float32Array => {
   const output = new Float32Array(payload)
   const [rx, ry, rz] = resolution
@@ -509,11 +613,11 @@ const denoiseIvolPayload = (resolution: Vec3Tuple, payload: Float32Array): Float
     for (let y = 0; y < ry; y += 1) {
       for (let x = 0; x < rx; x += 1) {
         const index = getPayloadProbeIndex(x, y, z, resolution)
-        const base = index * IVOL_PROBE_STRIDE_FLOATS
-        const centerVisibility = payload[base + 28]
-        const centerProximity = payload[base + 29]
-        const centerRelocation = payload[base + 33]
-        const sums = new Float32Array(28)
+        const base = index * WEBGPU_BAKE_PROBE_STRIDE_FLOATS
+        const centerVisibility = payload[base + 13]
+        const centerProximity = payload[base + 14]
+        const centerRelocation = payload[base + 18]
+        const sums = new Float32Array(12)
         let weightSum = 1
 
         for (let channel = 0; channel < sums.length; channel += 1) {
@@ -529,12 +633,12 @@ const denoiseIvolPayload = (resolution: Vec3Tuple, payload: Float32Array): Float
             continue
           }
 
-          const neighborBase = getPayloadProbeIndex(nx, ny, nz, resolution) * IVOL_PROBE_STRIDE_FLOATS
-          const visibilityDelta = Math.abs(centerVisibility - payload[neighborBase + 28])
-          const proximityDelta = Math.abs(centerProximity - payload[neighborBase + 29])
-          const relocationDelta = Math.abs(centerRelocation - payload[neighborBase + 33])
+          const neighborBase = getPayloadProbeIndex(nx, ny, nz, resolution) * WEBGPU_BAKE_PROBE_STRIDE_FLOATS
+          const visibilityDelta = Math.abs(centerVisibility - payload[neighborBase + 13])
+          const proximityDelta = Math.abs(centerProximity - payload[neighborBase + 14])
+          const relocationDelta = Math.abs(centerRelocation - payload[neighborBase + 18])
           const edgeWeight = Math.max(0, 1 - visibilityDelta * 1.8 - proximityDelta * 1.4 - relocationDelta * 0.9)
-          const neighborTrust = Math.max(0.08, payload[neighborBase + 28] * payload[neighborBase + 29])
+          const neighborTrust = Math.max(0.08, payload[neighborBase + 13] * payload[neighborBase + 14])
           const weight = 0.28 * edgeWeight * neighborTrust
 
           if (weight <= 0.0001) {
@@ -559,104 +663,125 @@ const denoiseIvolPayload = (resolution: Vec3Tuple, payload: Float32Array): Float
 
 const constrainIvolPayloadSh = (payload: Float32Array): Float32Array => {
   const output = new Float32Array(payload)
-  const probeCount = Math.floor(payload.length / IVOL_PROBE_STRIDE_FLOATS)
-  const sampleDirections: Vec3Tuple[] = [
-    [1, 0, 0],
-    [-1, 0, 0],
-    [0, 1, 0],
-    [0, -1, 0],
-    [0, 0, 1],
-    [0, 0, -1],
-  ]
+  const probeCount = Math.floor(payload.length / WEBGPU_BAKE_PROBE_STRIDE_FLOATS)
 
   for (let probeIndex = 0; probeIndex < probeCount; probeIndex += 1) {
-    const base = probeIndex * IVOL_PROBE_STRIDE_FLOATS
+    const base = probeIndex * WEBGPU_BAKE_PROBE_STRIDE_FLOATS
 
     for (let channel = 0; channel < 3; channel += 1) {
       const l0 = sanitizePositive(payload[base + channel])
       output[base + channel] = l0
 
-      const l1Limit = l0 * 1.18 + 0.0001
-      const l2Limit = l0 * 0.72 + 0.0001
+      const l1Limit = l0 * 2.0 + 0.0001
 
       for (let coefficient = 1; coefficient <= 3; coefficient += 1) {
         const offset = base + coefficient * 3 + channel
         output[offset] = clampFinite(payload[offset], -l1Limit, l1Limit)
       }
 
-      for (let coefficient = 4; coefficient <= 8; coefficient += 1) {
-        const offset = base + coefficient * 3 + channel
-        output[offset] = clampFinite(payload[offset], -l2Limit, l2Limit)
-      }
-    }
-
-    let worstScale = 1
-    for (const direction of sampleDirections) {
-      const irradiance = evaluatePackedShDirection(output, base, direction)
-      const ambientFloor = [
-        output[base] * 0.025,
-        output[base + 1] * 0.025,
-        output[base + 2] * 0.025,
-      ]
-
-      for (let channel = 0; channel < 3; channel += 1) {
-        if (irradiance[channel] < ambientFloor[channel]) {
-          const dynamic = irradiance[channel] - output[base + channel] * 0.42
-          if (dynamic < -0.0001) {
-            const allowed = ambientFloor[channel] - output[base + channel] * 0.42
-            worstScale = Math.min(worstScale, clamp01(allowed / dynamic))
-          }
-        }
-      }
-    }
-
-    if (worstScale < 0.999) {
-      for (let coefficient = 1; coefficient <= 8; coefficient += 1) {
-        const offset = base + coefficient * 3
-        output[offset] *= worstScale
-        output[offset + 1] *= worstScale
-        output[offset + 2] *= worstScale
-      }
     }
 
     const ambientEnergy = luminance(output[base], output[base + 1], output[base + 2])
-    output[base + 27] = clampFinite(payload[base + 27], 0, Math.max(0.0001, ambientEnergy * 4.5))
-    output[base + 28] = clamp01Finite(payload[base + 28], 1)
-    output[base + 29] = clamp01Finite(payload[base + 29], 1)
-    output[base + 33] = clamp01Finite(payload[base + 33], 0)
-    output[base + 34] = clamp01Finite(payload[base + 34], 1)
-    output[base + 35] = clamp01Finite(payload[base + 35], 1)
+    output[base + 12] = clampFinite(payload[base + 12], 0, Math.max(0.0001, ambientEnergy * 4.5))
+    output[base + 13] = clamp01Finite(payload[base + 13], 1)
+    output[base + 14] = clamp01Finite(payload[base + 14], 1)
+    output[base + 18] = clamp01Finite(payload[base + 18], 0)
   }
 
   return output
 }
 
-const evaluatePackedShDirection = (payload: Float32Array, base: number, direction: Vec3Tuple): Vec3Tuple => {
-  const [x, y, z] = direction
-  const result: Vec3Tuple = [0, 0, 0]
+const compactIvolPayload = (payload: Float32Array): Float32Array => {
+  const probeCount = Math.floor(payload.length / WEBGPU_BAKE_PROBE_STRIDE_FLOATS)
+  const output = new Float32Array(probeCount * IVOL_PROBE_STRIDE_FLOATS)
 
-  for (let channel = 0; channel < 3; channel += 1) {
-    const sh0 = payload[base + channel]
-    const sh1 = payload[base + 3 + channel]
-    const sh2 = payload[base + 6 + channel]
-    const sh3 = payload[base + 9 + channel]
-    const sh4 = payload[base + 12 + channel]
-    const sh5 = payload[base + 15 + channel]
-    const sh6 = payload[base + 18 + channel]
-    const sh7 = payload[base + 21 + channel]
-    const sh8 = payload[base + 24 + channel]
-    const l1 = sh1 * x + sh2 * y + sh3 * z
-    const l2 =
-      sh4 * (x * y) +
-      sh5 * (y * z) +
-      sh6 * (3 * z * z - 1) +
-      sh7 * (x * z) +
-      sh8 * (x * x - y * y)
+  for (let probeIndex = 0; probeIndex < probeCount; probeIndex += 1) {
+    const sourceBase = probeIndex * WEBGPU_BAKE_PROBE_STRIDE_FLOATS
+    const targetBase = probeIndex * IVOL_PROBE_STRIDE_FLOATS
 
-    result[channel] = sh0 * 0.42 + l1 * 0.72 + l2 * 0.32
+    // VRCLightVolumes stores the evaluated L1 representation directly:
+    // L0 is the omnidirectional term and each L1 vector has the same energy
+    // scale. Do not apply the unrelated normalized-SH 1/4 and 1/2 factors
+    // here; doing so makes diffuse receivers several stops too dark.
+    for (let channel = 0; channel < IVOL_PROBE_STRIDE_FLOATS; channel += 1) {
+      output[targetBase + channel] = payload[sourceBase + channel]
+    }
+
+    for (let color = 0; color < 3; color += 1) {
+      const x = output[targetBase + 3 + color]
+      const y = output[targetBase + 6 + color]
+      const z = output[targetBase + 9 + color]
+      const length = Math.hypot(x, y, z)
+      const l0 = output[targetBase + color]
+      if (length > 0 && l0 > 0) {
+        const scale = Math.min(l0 / length, 1.13)
+        output[targetBase + 3 + color] *= scale
+        output[targetBase + 6 + color] *= scale
+        output[targetBase + 9 + color] *= scale
+      }
+    }
   }
 
-  return result
+  return output
+}
+
+const colorCorrectIvolPayload = (
+  payload: Float32Array,
+  exposureEv: number,
+  shadows: number,
+  highlights: number,
+): Float32Array => {
+  const output = new Float32Array(payload)
+  const dark = -clampFinite(shadows, -1, 1) * 0.5
+  const bright = 1 - clampFinite(highlights, -1, 1) * 0.5
+  const correctionRange = Math.max(0.0001, bright - dark)
+  const exposureScale = 2 ** clampFinite(exposureEv, -8, 8)
+  const probeCount = Math.floor(output.length / IVOL_PROBE_STRIDE_FLOATS)
+
+  for (let probeIndex = 0; probeIndex < probeCount; probeIndex += 1) {
+    const base = probeIndex * IVOL_PROBE_STRIDE_FLOATS
+    correctVectorMagnitude(output, base, base + 1, base + 2, dark, correctionRange, exposureScale)
+    for (let color = 0; color < 3; color += 1) {
+      correctVectorMagnitude(
+        output,
+        base + 3 + color,
+        base + 6 + color,
+        base + 9 + color,
+        dark,
+        correctionRange,
+        exposureScale,
+      )
+    }
+  }
+
+  return output
+}
+
+const correctVectorMagnitude = (
+  values: Float32Array,
+  xIndex: number,
+  yIndex: number,
+  zIndex: number,
+  dark: number,
+  correctionRange: number,
+  exposureScale: number,
+): void => {
+  const x = values[xIndex]
+  const y = values[yIndex]
+  const z = values[zIndex]
+  const magnitude = Math.hypot(x, y, z)
+  if (magnitude <= 0.0000001) {
+    values[xIndex] = 0
+    values[yIndex] = 0
+    values[zIndex] = 0
+    return
+  }
+
+  const correctedMagnitude = Math.max(((magnitude - dark) / correctionRange) * exposureScale, 0)
+  const scale = correctedMagnitude / magnitude
+  values[xIndex] = x * scale
+  values[yIndex] = y * scale
+  values[zIndex] = z * scale
 }
 
 const sanitizePositive = (value: number): number =>
@@ -692,7 +817,7 @@ const createParams = (input: WebGPUBakeInput): Float32Array => {
   params[8] = input.bounds.max[0]
   params[9] = input.bounds.max[1]
   params[10] = input.bounds.max[2]
-  params[12] = input.exposure
+  params[12] = 1
   params[13] = input.bounces
   params[17] = 0
   params[18] = input.resolution[0] * input.resolution[1] * input.resolution[2]
@@ -700,6 +825,8 @@ const createParams = (input: WebGPUBakeInput): Float32Array => {
   params[20] = clampInteger(input.bounceRayCount ?? 4, 1, 8)
   params[21] = 0
   params[22] = clampInteger(input.accumulationSamples ?? 1, 1, 64)
+  params[23] = (input.relocateProbes ?? true) ? 1 : 0
+  params[24] = (input.pointLightShadows ?? true) ? 1 : 0
 
   return params
 }
@@ -731,8 +858,9 @@ type GeometryBuffers = {
   nodeCount: number
 }
 
-const createGeometryBuffers = (meshes: AbstractMesh[]): GeometryBuffers => {
-  const sourceTriangles = collectTriangles(meshes)
+const createGeometryBuffers = async (meshes: AbstractMesh[]): Promise<GeometryBuffers> => {
+  const materialAlbedos = await createMaterialAlbedoMap(meshes)
+  const sourceTriangles = collectTriangles(meshes, materialAlbedos)
 
   if (sourceTriangles.length === 0) {
     return createEmptyGeometryBuffers()
@@ -760,7 +888,10 @@ const createGeometryBuffers = (meshes: AbstractMesh[]): GeometryBuffers => {
   }
 }
 
-const collectTriangles = (meshes: AbstractMesh[]): TriangleRecord[] => {
+const collectTriangles = (
+  meshes: AbstractMesh[],
+  materialAlbedos: ReadonlyMap<Material, Vector3>,
+): TriangleRecord[] => {
   const triangles: TriangleRecord[] = []
 
   for (const mesh of meshes) {
@@ -776,7 +907,9 @@ const collectTriangles = (meshes: AbstractMesh[]): TriangleRecord[] => {
     }
 
     const world = mesh.computeWorldMatrix(true)
-    const albedo = getMaterialAlbedo(mesh.material)
+    const albedo = mesh.material instanceof Material
+      ? materialAlbedos.get(mesh.material) ?? getMaterialAlbedoFactor(mesh.material)
+      : DEFAULT_MATERIAL_ALBEDO
 
     for (let index = 0; index < indices.length; index += 3) {
       const i0 = indices[index] * 3
@@ -909,11 +1042,42 @@ const createEmptyGeometryBuffers = (): GeometryBuffers => ({
   nodeCount: 0,
 })
 
-const getMaterialAlbedo = (material: AbstractMesh['material']): Vector3 => {
-  if (!(material instanceof Material)) {
-    return new Vector3(0.72, 0.72, 0.72)
+const DEFAULT_MATERIAL_ALBEDO = new Vector3(0.72, 0.72, 0.72)
+
+const createMaterialAlbedoMap = async (meshes: AbstractMesh[]): Promise<Map<Material, Vector3>> => {
+  const materials = new Set<Material>()
+  for (const mesh of meshes) {
+    if (mesh.material instanceof Material) {
+      materials.add(mesh.material)
+    }
   }
 
+  const result = new Map<Material, Vector3>()
+  for (const material of materials) {
+    const factor = getMaterialAlbedoFactor(material)
+    const texture = getMaterialAlbedoTexture(material)
+    if (!texture) {
+      result.set(material, factor)
+      continue
+    }
+
+    try {
+      const textureAverage = await readTextureAverageLinear(texture)
+      result.set(material, new Vector3(
+        clampAlbedo(factor.x * textureAverage.x),
+        clampAlbedo(factor.y * textureAverage.y),
+        clampAlbedo(factor.z * textureAverage.z),
+      ))
+    } catch (error) {
+      console.warn(`Could not read albedo texture for ${material.name}; using its color factor.`, error)
+      result.set(material, factor)
+    }
+  }
+
+  return result
+}
+
+const getMaterialAlbedoFactor = (material: Material): Vector3 => {
   const candidate = material as Material & {
     albedoColor?: { r: number; g: number; b: number }
     baseColor?: { r: number; g: number; b: number }
@@ -922,15 +1086,86 @@ const getMaterialAlbedo = (material: AbstractMesh['material']): Vector3 => {
   const color = candidate.albedoColor ?? candidate.baseColor ?? candidate.diffuseColor
 
   if (!color) {
-    return new Vector3(0.72, 0.72, 0.72)
+    return DEFAULT_MATERIAL_ALBEDO
   }
 
   return new Vector3(
-    Math.min(1, Math.max(0.04, color.r)),
-    Math.min(1, Math.max(0.04, color.g)),
-    Math.min(1, Math.max(0.04, color.b)),
+    clampAlbedo(color.r),
+    clampAlbedo(color.g),
+    clampAlbedo(color.b),
   )
 }
+
+const getMaterialAlbedoTexture = (material: Material): BaseTexture | null => {
+  const candidate = material as Material & {
+    albedoTexture?: BaseTexture | null
+    baseTexture?: BaseTexture | null
+    diffuseTexture?: BaseTexture | null
+  }
+
+  return candidate.albedoTexture ?? candidate.baseTexture ?? candidate.diffuseTexture ?? null
+}
+
+const readTextureAverageLinear = async (texture: BaseTexture): Promise<Vector3> => {
+  const pixels = await texture.readPixels()
+  const values = pixels as NumericPixelArray | null
+  if (!values || values.length < 3) {
+    throw new Error('Texture readback returned no pixels.')
+  }
+
+  const size = texture.getSize()
+  const pixelCount = Math.max(1, size.width * size.height)
+  const channelCount = Math.max(3, Math.floor(values.length / pixelCount))
+  const sampleStride = Math.max(1, Math.ceil(pixelCount / 4096))
+  const valueScale = values instanceof Uint8Array || values instanceof Uint8ClampedArray
+    ? 1 / 255
+    : values instanceof Uint16Array
+      ? 1 / 65535
+      : 1
+  const gammaSpace = texture.gammaSpace
+  let red = 0
+  let green = 0
+  let blue = 0
+  let samples = 0
+
+  for (let pixel = 0; pixel < pixelCount; pixel += sampleStride) {
+    const base = pixel * channelCount
+    const r = Number(values[base]) * valueScale
+    const g = Number(values[base + 1]) * valueScale
+    const b = Number(values[base + 2]) * valueScale
+    red += gammaSpace ? srgbToLinear(r) : r
+    green += gammaSpace ? srgbToLinear(g) : g
+    blue += gammaSpace ? srgbToLinear(b) : b
+    samples += 1
+  }
+
+  if (samples === 0 || !Number.isFinite(red + green + blue)) {
+    throw new Error('Texture readback contained no finite RGB samples.')
+  }
+
+  return new Vector3(red / samples, green / samples, blue / samples)
+}
+
+type NumericPixelArray =
+  | Uint8Array
+  | Uint8ClampedArray
+  | Uint16Array
+  | Uint32Array
+  | Int8Array
+  | Int16Array
+  | Int32Array
+  | Float32Array
+  | Float64Array
+
+const srgbToLinear = (value: number): number => {
+  const clamped = Math.min(1, Math.max(0, value))
+  return clamped <= 0.04045
+    ? clamped / 12.92
+    : ((clamped + 0.055) / 1.055) ** 2.4
+}
+
+const clampAlbedo = (value: number): number =>
+  Number.isFinite(value) ? Math.min(1, Math.max(0.04, value)) : 0.72
 
 const getLongestAxis = (size: Vector3): 0 | 1 | 2 => {
   if (size.x >= size.y && size.x >= size.z) {
@@ -948,7 +1183,7 @@ const getAxis = (vector: Vector3, axis: 0 | 1 | 2): number => {
   return axis === 1 ? vector.y : vector.z
 }
 
-const computeMaxRayDistance = (bounds: IrradianceVolumeData['bounds']): number => {
+const computeMaxRayDistance = (bounds: IrradianceVolumeGrid['bounds']): number => {
   const size = new Vector3(
     bounds.max[0] - bounds.min[0],
     bounds.max[1] - bounds.min[1],
@@ -1020,15 +1255,16 @@ const WEBGPU_BAKE_SHADER = /* wgsl */ `
 @group(0) @binding(4) var<storage, read> bvhNodes : array<f32>;
 
 const LIGHT_STRIDE : u32 = 16u;
-const PROBE_STRIDE : u32 = 36u;
+const PROBE_STRIDE : u32 = 20u;
 const TRIANGLE_STRIDE : u32 = 16u;
 const BVH_NODE_STRIDE : u32 = 12u;
-const BVH_STACK_SIZE : u32 = 256u;
+const BVH_STACK_SIZE : u32 = 64u;
 const MAX_BOUNCE_RAY_COUNT : u32 = 8u;
 const MAX_AREA_LIGHT_SAMPLE_COUNT : u32 = 8u;
 const PROBE_VISIBILITY_RAY_COUNT : u32 = 8u;
 const PROBE_RELOCATION_RAY_COUNT : u32 = 12u;
 const PI : f32 = 3.14159265359;
+const INV_PI : f32 = 0.31830988618;
 const GOLDEN_ANGLE : f32 = 2.39996322973;
 const SHADOW_EPSILON : f32 = 0.006;
 const BOUNCE_EPSILON : f32 = 0.025;
@@ -1090,8 +1326,8 @@ fn probePosition(index: u32) -> vec3<f32> {
   let x = rem - y * rx;
   let minBounds = vec3<f32>(params[4], params[5], params[6]);
   let maxBounds = vec3<f32>(params[8], params[9], params[10]);
-  let denom = max(vec3<f32>(f32(rx - 1u), f32(ry - 1u), f32(rz - 1u)), vec3<f32>(1.0));
-  let uvw = vec3<f32>(f32(x), f32(y), f32(z)) / denom;
+  let gridSize = max(vec3<f32>(f32(rx), f32(ry), f32(rz)), vec3<f32>(1.0));
+  let uvw = (vec3<f32>(f32(x), f32(y), f32(z)) + vec3<f32>(0.5)) / gridSize;
 
   return mix(minBounds, maxBounds, uvw);
 }
@@ -1208,7 +1444,7 @@ fn traceRay(origin: vec3<f32>, direction: vec3<f32>, minT: f32, maxDistance: f32
   }
 
   var closest = missHit(maxDistance);
-  var stack: array<u32, 256>;
+  var stack: array<u32, 64>;
   var stackSize = 1u;
   stack[0] = 0u;
 
@@ -1266,7 +1502,7 @@ fn traceRay(origin: vec3<f32>, direction: vec3<f32>, minT: f32, maxDistance: f32
 
 fn rayOccluded(origin: vec3<f32>, direction: vec3<f32>, maxDistance: f32) -> bool {
   let triangleCount = u32(params[14]);
-  if (triangleCount == 0u || maxDistance <= SHADOW_EPSILON * 2.0) {
+  if (params[24] < 0.5 || triangleCount == 0u || maxDistance <= SHADOW_EPSILON * 2.0) {
     return false;
   }
 
@@ -1352,7 +1588,9 @@ fn lightContribution(lightIndex: u32, position: vec3<f32>, sampleSeed: u32) -> L
       let normalizedDistance = distance / safeRange;
       let rangeAttenuation = saturate(1.0 - normalizedDistance * normalizedDistance);
       if (rangeAttenuation > 0.0 && !rayOccluded(position + lightDirection * SHADOW_EPSILON, lightDirection, distance - SHADOW_EPSILON * 2.0)) {
-        let sampleIrradiance = color * intensity / (4.0 * PI * distanceSquared) * rangeAttenuation * rangeAttenuation * 2.4;
+        // Point-light intensity is authored in candela. Convert illuminance I/r^2
+        // to Lambertian outgoing radiance E/pi before projecting it into L1 SH.
+        let sampleIrradiance = color * intensity * INV_PI / distanceSquared * rangeAttenuation * rangeAttenuation;
         irradiance = irradiance + sampleIrradiance;
         weightedDirection = weightedDirection + lightDirection * length(sampleIrradiance);
       }
@@ -1415,7 +1653,7 @@ fn surfaceLightContribution(lightIndex: u32, position: vec3<f32>, normal: vec3<f
         rangeAttenuation > 0.0 &&
         !rayOccluded(position + normal * SHADOW_EPSILON, lightDirection, distance - SHADOW_EPSILON * 2.0)
       ) {
-        irradiance = irradiance + color * intensity / (4.0 * PI * distanceSquared) * rangeAttenuation * rangeAttenuation * normalTerm * 2.4;
+        irradiance = irradiance + color * intensity * INV_PI / distanceSquared * rangeAttenuation * rangeAttenuation * normalTerm;
       }
     }
 
@@ -1451,19 +1689,6 @@ fn shBasis4(direction: vec3<f32>) -> vec4<f32> {
     direction.y,
     direction.z,
   );
-}
-
-fn shBasis5(direction: vec3<f32>) -> vec4<f32> {
-  return vec4<f32>(
-    direction.x * direction.y,
-    direction.y * direction.z,
-    3.0 * direction.z * direction.z - 1.0,
-    direction.x * direction.z,
-  );
-}
-
-fn shBasis8(direction: vec3<f32>) -> f32 {
-  return direction.x * direction.x - direction.y * direction.y;
 }
 
 fn probeVisibilityRadius() -> f32 {
@@ -1505,15 +1730,16 @@ fn sphereDirection(sampleIndex: u32, count: u32, seed: u32) -> vec3<f32> {
   return vec3<f32>(cos(phi) * radius, z, sin(phi) * radius);
 }
 
-fn probeLocalVisibility(position: vec3<f32>, sampleSeed: u32) -> vec2<f32> {
+fn probeLocalVisibility(position: vec3<f32>, sampleSeed: u32) -> vec3<f32> {
   let triangleCount = u32(params[14]);
   let radius = probeVisibilityRadius();
   if (triangleCount == 0u || radius <= SHADOW_EPSILON * 2.0) {
-    return vec2<f32>(1.0, 1.0);
+    return vec3<f32>(1.0, 1.0, 0.0);
   }
 
   var openness = 0.0;
   var nearestDistance = radius;
+  var backfaces = 0.0;
 
   for (var sample = 0u; sample < PROBE_VISIBILITY_RAY_COUNT; sample = sample + 1u) {
     let direction = sphereDirection(sample, PROBE_VISIBILITY_RAY_COUNT, sampleSeed + sample * 719u + 97u);
@@ -1522,6 +1748,9 @@ fn probeLocalVisibility(position: vec3<f32>, sampleSeed: u32) -> vec2<f32> {
     if (hit.hit) {
       nearestDistance = min(nearestDistance, hit.t);
       openness = openness + smoothstep(radius * 0.16, radius, hit.t);
+      if (!hit.frontFacing) {
+        backfaces = backfaces + 1.0;
+      }
     } else {
       openness = openness + 1.0;
     }
@@ -1530,7 +1759,7 @@ fn probeLocalVisibility(position: vec3<f32>, sampleSeed: u32) -> vec2<f32> {
   let visibility = clamp(openness / f32(PROBE_VISIBILITY_RAY_COUNT), 0.0, 1.0);
   let normalizedNearest = clamp(nearestDistance / radius, 0.0, 1.0);
 
-  return vec2<f32>(visibility, normalizedNearest);
+  return vec3<f32>(visibility, normalizedNearest, backfaces / f32(PROBE_VISIBILITY_RAY_COUNT));
 }
 
 fn relocateProbePosition(position: vec3<f32>, sampleSeed: u32) -> RelocatedProbe {
@@ -1663,45 +1892,31 @@ fn main(@builtin(global_invocation_id) globalId : vec3<u32>) {
   let relocationSeed = index * 4099u;
   let outputBase = index * PROBE_STRIDE;
   var relocatedProbe = RelocatedProbe(gridPosition, vec3<f32>(0.0), 0.0);
-  if (accumulationSampleIndex == 0u) {
+  if (accumulationSampleIndex == 0u && params[23] >= 0.5) {
     relocatedProbe = relocateProbePosition(gridPosition, relocationSeed);
   } else {
     let storedOffset = vec3<f32>(
-      outputData[outputBase + 30u],
-      outputData[outputBase + 31u],
-      outputData[outputBase + 32u],
+      outputData[outputBase + 15u],
+      outputData[outputBase + 16u],
+      outputData[outputBase + 17u],
     );
-    relocatedProbe = RelocatedProbe(gridPosition + storedOffset, storedOffset, outputData[outputBase + 33u]);
+    relocatedProbe = RelocatedProbe(gridPosition + storedOffset, storedOffset, outputData[outputBase + 18u]);
   }
   let position = relocatedProbe.position;
-  var ambient = vec3<f32>(0.015, 0.017, 0.02);
-  var directIrradiance = vec3<f32>(0.0);
-  var bouncedIrradiance = vec3<f32>(0.0);
+  let ambient = vec3<f32>(0.015, 0.017, 0.02);
   var sh0 = ambient;
   var sh1 = vec3<f32>(0.0);
   var sh2 = vec3<f32>(0.0);
   var sh3 = vec3<f32>(0.0);
-  var sh4 = vec3<f32>(0.0);
-  var sh5 = vec3<f32>(0.0);
-  var sh6 = vec3<f32>(0.0);
-  var sh7 = vec3<f32>(0.0);
-  var sh8 = vec3<f32>(0.0);
   var dominantIntensity = 0.0;
 
   for (var i = 0u; i < lightCount; i = i + 1u) {
     let contribution = lightContribution(i, position, sampleSeed);
     let basisA = shBasis4(contribution.directionToLight);
-    let basisB = shBasis5(contribution.directionToLight);
-    directIrradiance = directIrradiance + contribution.irradiance;
     sh0 = sh0 + contribution.irradiance * basisA.x;
     sh1 = sh1 + contribution.irradiance * basisA.y;
     sh2 = sh2 + contribution.irradiance * basisA.z;
     sh3 = sh3 + contribution.irradiance * basisA.w;
-    sh4 = sh4 + contribution.irradiance * basisB.x;
-    sh5 = sh5 + contribution.irradiance * basisB.y;
-    sh6 = sh6 + contribution.irradiance * basisB.z;
-    sh7 = sh7 + contribution.irradiance * basisB.w;
-    sh8 = sh8 + contribution.irradiance * shBasis8(contribution.directionToLight);
 
     if (contribution.dominantIntensity > dominantIntensity) {
       dominantIntensity = contribution.dominantIntensity;
@@ -1716,29 +1931,16 @@ fn main(@builtin(global_invocation_id) globalId : vec3<u32>) {
     let direction = sphereDirection(sample, bounceRayCount, sampleSeed + sample * 101u);
     let bounceContribution = traceBounceContribution(index, position, direction, lightCount, bounces, sample, bounceRayCount, sampleSeed);
     let basisA = shBasis4(direction);
-    let basisB = shBasis5(direction);
-    bouncedIrradiance = bouncedIrradiance + bounceContribution;
     sh0 = sh0 + bounceContribution * basisA.x;
     sh1 = sh1 + bounceContribution * basisA.y;
     sh2 = sh2 + bounceContribution * basisA.z;
     sh3 = sh3 + bounceContribution * basisA.w;
-    sh4 = sh4 + bounceContribution * basisB.x;
-    sh5 = sh5 + bounceContribution * basisB.y;
-    sh6 = sh6 + bounceContribution * basisB.z;
-    sh7 = sh7 + bounceContribution * basisB.w;
-    sh8 = sh8 + bounceContribution * shBasis8(direction);
   }
 
-  ambient = (ambient + directIrradiance + bouncedIrradiance) * exposure;
   sh0 = sh0 * exposure;
   sh1 = sh1 * exposure;
   sh2 = sh2 * exposure;
   sh3 = sh3 * exposure;
-  sh4 = sh4 * exposure;
-  sh5 = sh5 * exposure;
-  sh6 = sh6 * exposure;
-  sh7 = sh7 * exposure;
-  sh8 = sh8 * exposure;
   outputData[outputBase] = outputData[outputBase] + sh0.r * accumulationWeight;
   outputData[outputBase + 1u] = outputData[outputBase + 1u] + sh0.g * accumulationWeight;
   outputData[outputBase + 2u] = outputData[outputBase + 2u] + sh0.b * accumulationWeight;
@@ -1751,32 +1953,16 @@ fn main(@builtin(global_invocation_id) globalId : vec3<u32>) {
   outputData[outputBase + 9u] = outputData[outputBase + 9u] + sh3.r * accumulationWeight;
   outputData[outputBase + 10u] = outputData[outputBase + 10u] + sh3.g * accumulationWeight;
   outputData[outputBase + 11u] = outputData[outputBase + 11u] + sh3.b * accumulationWeight;
-  outputData[outputBase + 12u] = outputData[outputBase + 12u] + sh4.r * accumulationWeight;
-  outputData[outputBase + 13u] = outputData[outputBase + 13u] + sh4.g * accumulationWeight;
-  outputData[outputBase + 14u] = outputData[outputBase + 14u] + sh4.b * accumulationWeight;
-  outputData[outputBase + 15u] = outputData[outputBase + 15u] + sh5.r * accumulationWeight;
-  outputData[outputBase + 16u] = outputData[outputBase + 16u] + sh5.g * accumulationWeight;
-  outputData[outputBase + 17u] = outputData[outputBase + 17u] + sh5.b * accumulationWeight;
-  outputData[outputBase + 18u] = outputData[outputBase + 18u] + sh6.r * accumulationWeight;
-  outputData[outputBase + 19u] = outputData[outputBase + 19u] + sh6.g * accumulationWeight;
-  outputData[outputBase + 20u] = outputData[outputBase + 20u] + sh6.b * accumulationWeight;
-  outputData[outputBase + 21u] = outputData[outputBase + 21u] + sh7.r * accumulationWeight;
-  outputData[outputBase + 22u] = outputData[outputBase + 22u] + sh7.g * accumulationWeight;
-  outputData[outputBase + 23u] = outputData[outputBase + 23u] + sh7.b * accumulationWeight;
-  outputData[outputBase + 24u] = outputData[outputBase + 24u] + sh8.r * accumulationWeight;
-  outputData[outputBase + 25u] = outputData[outputBase + 25u] + sh8.g * accumulationWeight;
-  outputData[outputBase + 26u] = outputData[outputBase + 26u] + sh8.b * accumulationWeight;
-  outputData[outputBase + 27u] = outputData[outputBase + 27u] + dominantIntensity * exposure * accumulationWeight;
+  outputData[outputBase + 12u] = outputData[outputBase + 12u] + dominantIntensity * exposure * accumulationWeight;
   if (accumulationSampleIndex == 0u) {
     let localVisibility = probeLocalVisibility(position, relocationSeed);
-    outputData[outputBase + 28u] = localVisibility.x;
-    outputData[outputBase + 29u] = localVisibility.y;
-    outputData[outputBase + 30u] = relocatedProbe.offset.x;
-    outputData[outputBase + 31u] = relocatedProbe.offset.y;
-    outputData[outputBase + 32u] = relocatedProbe.offset.z;
-    outputData[outputBase + 33u] = relocatedProbe.strength;
-    outputData[outputBase + 34u] = 1.0;
-    outputData[outputBase + 35u] = 1.0;
+    outputData[outputBase + 13u] = localVisibility.x;
+    outputData[outputBase + 14u] = localVisibility.y;
+    outputData[outputBase + 15u] = relocatedProbe.offset.x;
+    outputData[outputBase + 16u] = relocatedProbe.offset.y;
+    outputData[outputBase + 17u] = relocatedProbe.offset.z;
+    outputData[outputBase + 18u] = relocatedProbe.strength;
+    outputData[outputBase + 19u] = localVisibility.z;
   }
 }
 `

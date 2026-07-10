@@ -1,7 +1,5 @@
 import type { BinaryIrradianceVolume } from './irradianceVolume'
 import { binaryVolumeQualitySummary, binaryVolumeSummary, parseIvolBinary } from './irradianceVolume'
-import type { StaticShadowMask } from './staticShadowMask'
-import { parseStaticShadowMaskBinary, shadowMaskQualitySummary, shadowMaskSummary } from './staticShadowMask'
 
 export const IRRADIANCE_BAKE_BUNDLE_MAGIC = 'IVPK'
 export const IRRADIANCE_BAKE_BUNDLE_EXTENSION = '.ivpack'
@@ -12,14 +10,12 @@ const IVPK_VERSION = 1
 
 const CHUNK_BASE_IVOL = fourCc('BASE')
 const CHUNK_DETAIL_IVOL = fourCc('DTIL')
-const CHUNK_SHADOW_MASK = fourCc('SHDW')
 
 export type IrradianceBakeBundle = {
   kind: 'bundle'
   buffer: ArrayBuffer
   baseVolume: BinaryIrradianceVolume
   detailVolume: BinaryIrradianceVolume | null
-  shadowMask: StaticShadowMask | null
 }
 
 type BundleChunkInput = {
@@ -36,15 +32,11 @@ type BundleChunk = {
 export const createIrradianceBakeBundle = (
   baseIvol: ArrayBuffer,
   detailIvol: ArrayBuffer | null,
-  shadowMask: ArrayBuffer | null,
 ): ArrayBuffer => {
   const chunks: BundleChunkInput[] = [{ type: CHUNK_BASE_IVOL, buffer: baseIvol }]
 
   if (detailIvol) {
     chunks.push({ type: CHUNK_DETAIL_IVOL, buffer: detailIvol })
-  }
-  if (shadowMask) {
-    chunks.push({ type: CHUNK_SHADOW_MASK, buffer: shadowMask })
   }
 
   const tableBytes = chunks.length * IVPK_CHUNK_ENTRY_BYTES
@@ -109,7 +101,8 @@ export const parseIrradianceBakeBundle = (buffer: ArrayBuffer): IrradianceBakeBu
 
   if (
     chunkCount < 1 ||
-    tableOffset < IVPK_HEADER_BYTES ||
+    chunkCount > 2 ||
+    tableOffset !== IVPK_HEADER_BYTES ||
     tableByteLength / IVPK_CHUNK_ENTRY_BYTES !== chunkCount ||
     tableEnd > buffer.byteLength
   ) {
@@ -117,6 +110,7 @@ export const parseIrradianceBakeBundle = (buffer: ArrayBuffer): IrradianceBakeBu
   }
 
   const chunks = new Map<number, ArrayBuffer>()
+  const ranges: Array<{ offset: number; end: number }> = []
   for (let index = 0; index < chunkCount; index += 1) {
     const entryOffset = tableOffset + index * IVPK_CHUNK_ENTRY_BYTES
     const type = view.getUint32(entryOffset, true)
@@ -125,6 +119,8 @@ export const parseIrradianceBakeBundle = (buffer: ArrayBuffer): IrradianceBakeBu
     const end = offset + byteLength
 
     if (
+      (type !== CHUNK_BASE_IVOL && type !== CHUNK_DETAIL_IVOL) ||
+      chunks.has(type) ||
       offset < tableEnd ||
       offset % 4 !== 0 ||
       byteLength < 1 ||
@@ -135,6 +131,14 @@ export const parseIrradianceBakeBundle = (buffer: ArrayBuffer): IrradianceBakeBu
     }
 
     chunks.set(type, buffer.slice(offset, end))
+    ranges.push({ offset, end })
+  }
+
+  ranges.sort((a, b) => a.offset - b.offset)
+  for (let index = 1; index < ranges.length; index += 1) {
+    if (ranges[index].offset < ranges[index - 1].end) {
+      throw new Error('Irradiance bake bundle chunks overlap.')
+    }
   }
 
   const baseIvol = chunks.get(CHUNK_BASE_IVOL)
@@ -143,14 +147,11 @@ export const parseIrradianceBakeBundle = (buffer: ArrayBuffer): IrradianceBakeBu
   }
 
   const detailIvol = chunks.get(CHUNK_DETAIL_IVOL)
-  const shadowMask = chunks.get(CHUNK_SHADOW_MASK)
-
   return {
     kind: 'bundle',
     buffer,
     baseVolume: parseIvolBinary(baseIvol),
     detailVolume: detailIvol ? parseIvolBinary(detailIvol) : null,
-    shadowMask: shadowMask ? parseStaticShadowMaskBinary(shadowMask) : null,
   }
 }
 
@@ -166,9 +167,6 @@ export const irradianceBakeBundleSummary = (bundle: IrradianceBakeBundle): strin
   if (bundle.detailVolume) {
     parts.push(`detail ${binaryVolumeSummary(bundle.detailVolume)}`)
   }
-  if (bundle.shadowMask) {
-    parts.push(shadowMaskSummary(bundle.shadowMask))
-  }
 
   return parts.join(' / ')
 }
@@ -178,9 +176,6 @@ export const irradianceBakeBundleQualitySummary = (bundle: IrradianceBakeBundle)
 
   if (bundle.detailVolume) {
     parts.push(`detail ${binaryVolumeQualitySummary(bundle.detailVolume)}`)
-  }
-  if (bundle.shadowMask) {
-    parts.push(`static ${shadowMaskQualitySummary(bundle.shadowMask)}`)
   }
 
   return parts.join(' / ')

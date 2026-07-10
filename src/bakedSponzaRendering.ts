@@ -14,10 +14,8 @@ import type { BinaryIrradianceVolume } from './irradianceVolume'
 import type {
   IrradianceVolumePbrPlugin,
   IrradianceVolumeTexture,
-  StaticShadowMaskTexture,
 } from './irradianceVolumePbrPlugin'
 import {
-  updateStaticShadowMaskPlugins,
   updateIrradianceVolumePlugins,
 } from './irradianceVolumePbrPlugin'
 import type { SponzaApp } from './sponzaScene'
@@ -48,8 +46,6 @@ type SyncBakedSponzaLightingOptions = {
   staticPlugins: IrradianceVolumePbrPlugin[]
   dynamicPlugins: IrradianceVolumePbrPlugin[]
   volumeTexture: IrradianceVolumeTexture | null
-  detailVolumeTexture: IrradianceVolumeTexture | null
-  shadowMaskTexture: StaticShadowMaskTexture | null
   intensity: number
 }
 
@@ -83,18 +79,16 @@ export function configureBakedSponzaStaticMeshes(meshes: AbstractMesh[]): void {
 }
 
 export function syncBakedSponzaLightingPlugins(options: SyncBakedSponzaLightingOptions): void {
-  const dynamicDetailTexture = options.shadowMaskTexture ? null : options.detailVolumeTexture
-
-  updateIrradianceVolumePlugins(options.staticPlugins, options.volumeTexture, options.intensity)
-  updateStaticShadowMaskPlugins(options.staticPlugins, options.shadowMaskTexture)
-
+  updateIrradianceVolumePlugins(
+    options.staticPlugins,
+    options.volumeTexture,
+    options.intensity,
+  )
   updateIrradianceVolumePlugins(
     options.dynamicPlugins,
     options.volumeTexture,
     options.intensity,
-    dynamicDetailTexture,
   )
-  updateStaticShadowMaskPlugins(options.dynamicPlugins, null)
 }
 
 export function createBakedDynamicObjects(
