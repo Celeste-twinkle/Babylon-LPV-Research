@@ -301,69 +301,16 @@ export function installDirectPreviewShaderErrorAudit(app: SponzaApp): string[] {
 
 export async function loadDirectPreviewBundle(bundlePath: string): Promise<DirectPreviewBundle> {
   const response = await fetch(assetUrl(bundlePath))
-  const directBuffer = response.ok ? await response.arrayBuffer() : null
-
-  if (directBuffer && hasIrradianceBakeBundleMagic(directBuffer)) {
-    return parseIrradianceBakeBundle(directBuffer)
+  if (!response.ok) {
+    throw new Error(`Could not fetch ${bundlePath}: HTTP ${response.status}.`)
   }
 
-  const chunkedBundle = await tryLoadChunkedDirectPreviewBundle(bundlePath)
-  if (chunkedBundle) {
-    return parseIrradianceBakeBundle(chunkedBundle)
+  const bundle = await response.arrayBuffer()
+  if (!hasIrradianceBakeBundleMagic(bundle)) {
+    throw new Error(`Could not load ${bundlePath}: the response is not an IVPK bundle.`)
   }
 
-  if (response.ok) {
-    throw new Error(`Could not load ${bundlePath}: the response is not an IVPK bundle and no chunk manifest was found.`)
-  }
-
-  throw new Error(`Could not fetch ${bundlePath}: HTTP ${response.status}.`)
-}
-
-type ChunkedDirectPreviewManifest = {
-  chunks: string[]
-  size: number
-}
-
-async function tryLoadChunkedDirectPreviewBundle(bundlePath: string): Promise<ArrayBuffer | null> {
-  const manifestResponse = await fetch(assetUrl(`${bundlePath}.parts.json`))
-  if (!manifestResponse.ok) {
-    return null
-  }
-
-  const manifest = await manifestResponse.json() as ChunkedDirectPreviewManifest
-  if (!Array.isArray(manifest.chunks) || manifest.chunks.length === 0) {
-    throw new Error(`Invalid chunk manifest for ${bundlePath}.`)
-  }
-
-  const basePath = bundlePath.includes('/')
-    ? bundlePath.slice(0, bundlePath.lastIndexOf('/') + 1)
-    : ''
-  const chunks: Uint8Array[] = []
-  let totalLength = 0
-
-  for (const chunkName of manifest.chunks) {
-    const chunkResponse = await fetch(assetUrl(`${basePath}${chunkName}`))
-    if (!chunkResponse.ok) {
-      throw new Error(`Could not fetch ${chunkName}: HTTP ${chunkResponse.status}.`)
-    }
-
-    const chunk = new Uint8Array(await chunkResponse.arrayBuffer())
-    chunks.push(chunk)
-    totalLength += chunk.byteLength
-  }
-
-  if (Number.isFinite(manifest.size) && manifest.size !== totalLength) {
-    throw new Error(`Chunked bundle size mismatch for ${bundlePath}: expected ${manifest.size}, got ${totalLength}.`)
-  }
-
-  const bundle = new Uint8Array(totalLength)
-  let offset = 0
-  for (const chunk of chunks) {
-    bundle.set(chunk, offset)
-    offset += chunk.byteLength
-  }
-
-  return bundle.buffer
+  return parseIrradianceBakeBundle(bundle)
 }
 
 export function formatDirectPreviewSummary(state: DirectPreviewLoadedState): string {
