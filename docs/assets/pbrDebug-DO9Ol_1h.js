@@ -1,4 +1,4 @@
-import{t as e}from"./shaderStore-D-XQlhUT.js";import"./oitFragment-DDHEdOe1.js";import"./logDepthDeclaration-BYs2zDV7.js";var t=`pbrFragmentExtraDeclaration`,n=`varying vPositionW: vec3f;
+import{t as e}from"./shaderStore-D-XQlhUT.js";import"./oitFragment-BCdUSeTI.js";import"./logDepthDeclaration-BYs2zDV7.js";var t=`pbrFragmentExtraDeclaration`,n=`varying vPositionW: vec3f;
 #if DEBUGMODE>0
 varying vClipSpacePosition: vec4f;
 #endif

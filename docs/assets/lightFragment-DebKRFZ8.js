@@ -1,14 +1,4 @@
-import{t as e}from"./shaderStore-D-XQlhUT.js";var t=`decalFragment`,n=`#ifdef DECAL
-var decalTempColor=decalColor.rgb;var decalTempAlpha=decalColor.a;
-#ifdef GAMMADECAL
-decalTempColor=toLinearSpaceVec3(decalColor.rgb);
-#endif
-#ifdef DECAL_SMOOTHALPHA
-decalTempAlpha=decalColor.a*decalColor.a;
-#endif
-surfaceAlbedo=mix(surfaceAlbedo.rgb,decalTempColor,decalTempAlpha);
-#endif
-`;e.IncludesShadersStoreWGSL[t]||(e.IncludesShadersStoreWGSL[t]=n);var r={name:t,shader:n},i=`lightFragment`,a=`#ifdef LIGHT{X}
+import{t as e}from"./shaderStore-D-XQlhUT.js";var t=`lightFragment`,n=`#ifdef LIGHT{X}
 #if defined(SHADOWONLY) || defined(LIGHTMAP) && defined(LIGHTMAPEXCLUDED{X}) && defined(LIGHTMAPNOSPECULAR{X})
 #else
 var diffuse{X}: vec4f=light{X}.vLightDiffuse;
@@ -395,4 +385,4 @@ sheenBase+=info.sheen.rgb*shadow;
 #endif
 #endif
 #endif
-`;e.IncludesShadersStoreWGSL[i]||(e.IncludesShadersStoreWGSL[i]=a);var o={name:i,shader:a};export{r as n,o as t};
+`;e.IncludesShadersStoreWGSL[t]||(e.IncludesShadersStoreWGSL[t]=n);var r={name:t,shader:n};export{r as t};

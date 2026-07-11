@@ -43,13 +43,15 @@ The bake page:
 - builds a triangle BVH from static world geometry;
 - reads material base-color textures and uses their linear-space average for bounced light;
 - relocates probes away from nearby geometry;
-- traces hard or radius-softened point lights with visibility;
-- treats point-light intensity as candela and projects Lambertian outgoing radiance `I / (pi * distance^2)` into L1 SH;
+- traces Point, Spot, Directional, and Rect Area lights with ray-tested visibility;
+- treats Point and Spot intensity as candela, Directional intensity as lux, and Rect Area intensity as luminance in `cd/m²`;
+- supports radius-softened Point/Spot shadows, angular-radius Directional shadows, Spot inner/outer cones, and stratified Rect Area sampling;
+- uses Babylon's photometric scaling for Point, Spot, and Directional intensity modes before projecting direct and bounced light into L1 SH;
 - traces configurable indirect bounces;
 - performs visibility-aware spatial denoising;
 - writes compact base/detail `.ivol` chunks into one `.ivpack` bundle.
 
-Manual XYZ resolution is used when adaptive resolution is disabled. The page shows the effective grid, asset size, temporary GPU probe memory, and safety-budget violations before baking. The detail volume is an optional Babylon-specific extension and is disabled by default.
+Manual XYZ resolution is used when adaptive resolution is disabled. The page shows the effective grid, asset size, temporary GPU probe memory, and safety-budget violations before baking. The Babylon-specific detail volume is enabled by default: it fits compact regions around active Spotlight cones and the high-gradient near field of Rect Area lights, then falls back to geometry-aware bounds when no local-light region is available. Directional lights stay on the base/geometry grid because their unshadowed field has no bounded local region. Detail probes are capped to 35% of the base grid (with a 65,536-probe absolute ceiling) so the `.ivpack` payload cannot grow without bound.
 
 Probe visibility and relocation values are temporary bake data. They are not serialized or sampled at runtime.
 
@@ -74,8 +76,12 @@ Use `npm run typecheck` and `npm run build` for verification.
 
 This repository targets baked irradiance-volume lighting rather than every Unity/VRChat management feature in VRCLightVolumes. The implemented port covers its L1 SH representation, three-island packing, hardware trilinear sampling, overlapping base/detail volume blending, full per-channel specular model, and optional dominant-direction specular model. Runtime analytic-light arrays, cookies, rotated/additive volume authoring, and separate four-channel shadowmask volumes are outside the current Sponza bake workflow.
 
-The WebGPU baker currently uses material-average albedo rather than per-ray UV texture lookup, and does not yet treat emissive surfaces or an HDR environment as light sources.
+The WebGPU baker currently uses material-average albedo rather than per-ray UV texture lookup, and does not yet treat emissive surfaces or an HDR environment as light sources. Hemispheric lights are intentionally outside the physical-light bake set.
 
 ## Attribution
 
 The SH packing, evaluation, and full/dominant-direction specular models are derived from VRCLightVolumes by RED_SIM. See [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
+
+## License
+
+This project is licensed under the [MIT License](./LICENSE). VRCLightVolumes-derived work retains its original MIT notice in [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).

@@ -16,84 +16,7 @@ varying vCurrentPosition: vec4f;varying vPreviousPosition: vec4f;
 #define MAX_DEPTH 99999.0
 var oitDepthSamplerSampler: sampler;var oitDepthSampler: texture_2d<f32>;var oitFrontColorSamplerSampler: sampler;var oitFrontColorSampler: texture_2d<f32>;
 #endif
-`;e.IncludesShadersStoreWGSL[i]||(e.IncludesShadersStoreWGSL[i]=a);var o={name:i,shader:a},s=`lightUboDeclaration`,c=`#ifdef LIGHT{X}
-struct Light{X}
-{vLightData: vec4f,
-vLightDiffuse: vec4f,
-vLightSpecular: vec4f,
-#ifdef SPOTLIGHT{X}
-vLightDirection: vec4f,
-vLightFalloff: vec4f,
-#elif defined(POINTLIGHT{X})
-vLightFalloff: vec4f,
-#elif defined(HEMILIGHT{X})
-vLightGround: vec3f,
-#elif defined(CLUSTLIGHT{X})
-vSliceData: vec2f,
-vSliceRanges: array<vec4f,CLUSTLIGHT_SLICES>,
-#endif
-#if defined(AREALIGHT{X}) && defined(AREALIGHTUSED) && defined(AREALIGHTSUPPORTED)
-vLightWidth: vec4f,
-vLightHeight: vec4f,
-#endif
-shadowsInfo: vec4f,
-depthValues: vec2f} ;var<uniform> light{X} : Light{X};
-#ifdef IESLIGHTTEXTURE{X}
-var iesLightTexture{X}Sampler: sampler;var iesLightTexture{X}: texture_2d<f32>;
-#endif
-#ifdef RECTAREALIGHTEMISSIONTEXTURE{X}
-var rectAreaLightEmissionTexture{X}Sampler: sampler;var rectAreaLightEmissionTexture{X}: texture_2d<f32>;
-#endif
-#ifdef PROJECTEDLIGHTTEXTURE{X}
-uniform textureProjectionMatrix{X}: mat4x4f;var projectionLightTexture{X}Sampler: sampler;var projectionLightTexture{X}: texture_2d<f32>;
-#endif
-#ifdef CLUSTLIGHT{X}
-var lightDataTexture{X}: texture_2d<f32>;var<storage,read> tileMaskBuffer{X}: array<u32>;
-#endif
-#ifdef SHADOW{X}
-#ifdef SHADOWCSM{X}
-uniform lightMatrix{X}: array<mat4x4f,SHADOWCSMNUM_CASCADES{X}>;uniform viewFrustumZ{X}: array<f32,SHADOWCSMNUM_CASCADES{X}>;uniform frustumLengths{X}: array<f32,SHADOWCSMNUM_CASCADES{X}>;uniform cascadeBlendFactor{X}: f32;varying vPositionFromLight{X}_0: vec4f;varying vDepthMetric{X}_0: f32;varying vPositionFromLight{X}_1: vec4f;varying vDepthMetric{X}_1: f32;varying vPositionFromLight{X}_2: vec4f;varying vDepthMetric{X}_2: f32;varying vPositionFromLight{X}_3: vec4f;varying vDepthMetric{X}_3: f32;varying vPositionFromCamera{X}: vec4f;var<private> vPositionFromLight{X}: array<vec4f,4>;var<private> vDepthMetric{X} : array<f32,4>;
-#if defined(SHADOWPCSS{X})
-var shadowTexture{X}Sampler: sampler_comparison; 
-var shadowTexture{X}: texture_depth_2d_array;var depthTexture{X}Sampler: sampler;var depthTexture{X}: texture_2d_array<f32>;uniform lightSizeUVCorrection{X}: array<vec2f,SHADOWCSMNUM_CASCADES{X}>;uniform depthCorrection{X}: array<f32,SHADOWCSMNUM_CASCADES{X}>;uniform penumbraDarkness{X}: f32;
-#elif defined(SHADOWPCF{X})
-var shadowTexture{X}Sampler: sampler_comparison;var shadowTexture{X}: texture_depth_2d_array;
-#else 
-var shadowTexture{X}Sampler: sampler; 
-var shadowTexture{X}: texture_2d_array<f32>;
-#endif
-#ifdef SHADOWCSMDEBUG{X}
-const vCascadeColorsMultiplier{X}: array<vec3f,8>=array<vec3f,8>
-(
-vec3f ( 1.5,0.0,0.0 ),
-vec3f ( 0.0,1.5,0.0 ),
-vec3f ( 0.0,0.0,5.5 ),
-vec3f ( 1.5,0.0,5.5 ),
-vec3f ( 1.5,1.5,0.0 ),
-vec3f ( 1.0,1.0,1.0 ),
-vec3f ( 0.0,1.0,5.5 ),
-vec3f ( 0.5,3.5,0.75 )
-);
-#endif
-#elif defined(SHADOWCUBE{X})
-var shadowTexture{X}Sampler: sampler;var shadowTexture{X}: texture_cube<f32>;
-#else
-varying vPositionFromLight{X}: vec4f;varying vDepthMetric{X}: f32;
-#if defined(SHADOWPCSS{X})
-var shadowTexture{X}Sampler: sampler_comparison; 
-var shadowTexture{X}: texture_depth_2d;var depthTexture{X}Sampler: sampler; 
-var depthTexture{X}: texture_2d<f32>;
-#elif defined(SHADOWPCF{X})
-var shadowTexture{X}Sampler: sampler_comparison;var shadowTexture{X}: texture_depth_2d;
-#else
-var shadowTexture{X}Sampler: sampler; 
-var shadowTexture{X}: texture_2d<f32>;
-#endif
-uniform lightMatrix{X}: mat4x4f;
-#endif
-#endif
-#endif
-`;e.IncludesShadersStoreWGSL[s]||(e.IncludesShadersStoreWGSL[s]=c);var l={name:s,shader:c},u=`ltcHelperFunctions`,d=`fn LTCUv(N: vec3f,V: vec3f,roughness: f32)->vec2f {var LUTSIZE: f32=64.0;var LUTSCALE: f32=( LUTSIZE-1.0 )/LUTSIZE;var LUTBIAS:f32=0.5/LUTSIZE;var dotNV:f32=saturate( dot( N,V ) );var uv:vec2f=vec2f( roughness,sqrt( 1.0-dotNV ) );uv=uv*LUTSCALE+LUTBIAS;return uv;}
+`;e.IncludesShadersStoreWGSL[i]||(e.IncludesShadersStoreWGSL[i]=a);var o={name:i,shader:a},s=`ltcHelperFunctions`,c=`fn LTCUv(N: vec3f,V: vec3f,roughness: f32)->vec2f {var LUTSIZE: f32=64.0;var LUTSCALE: f32=( LUTSIZE-1.0 )/LUTSIZE;var LUTBIAS:f32=0.5/LUTSIZE;var dotNV:f32=saturate( dot( N,V ) );var uv:vec2f=vec2f( roughness,sqrt( 1.0-dotNV ) );uv=uv*LUTSCALE+LUTBIAS;return uv;}
 fn LTCClippedSphereFormFactor( f:vec3f )->f32 {var l: f32=length( f );return max( ( l*l+f.z )/( l+1.0 ),0.0 );}
 fn LTCEdgeVectorFormFactor( v1:vec3f,v2:vec3f )->vec3f {var x:f32=dot( v1,v2 );var y:f32=abs( x );var a:f32=0.8543985+( 0.4965155+0.0145206*y )*y;var b:f32=3.4175940+( 4.1616724+y )*y;var v:f32=a/b;var thetaSintheta:f32=0.0;if( x>0.0 )
 {thetaSintheta=v;}
@@ -137,7 +60,7 @@ vec3f(1,0,0),
 vec3f(0,1,0),
 vec3f(0,0,1)
 );result.Diffuse=LTCEvaluateWithEmission(normal,viewDir,position,mInvEmpty,rectCoords0,rectCoords1,rectCoords2,rectCoords3,emissionTexture,emissionTextureSampler);return result;}
-`;e.IncludesShadersStoreWGSL[u]||(e.IncludesShadersStoreWGSL[u]=d);var f={name:u,shader:d},p=`clusteredLightingFunctions`,m=`struct ClusteredLight {vLightData: vec4f,
+`;e.IncludesShadersStoreWGSL[s]||(e.IncludesShadersStoreWGSL[s]=c);var l={name:s,shader:c},u=`clusteredLightingFunctions`,d=`struct ClusteredLight {vLightData: vec4f,
 vLightDiffuse: vec4f,
 vLightSpecular: vec4f,
 vLightDirection: vec4f,
@@ -150,7 +73,7 @@ textureLoad(lightDataTexture,vec2u(3,index),0),
 textureLoad(lightDataTexture,vec2u(4,index),0)
 );}
 fn getClusteredSliceIndex(sliceData: vec2f,viewDepth: f32)->i32 {return i32(log(viewDepth)*sliceData.x+sliceData.y);}
-`;e.IncludesShadersStoreWGSL[p]||(e.IncludesShadersStoreWGSL[p]=m);var h={name:p,shader:m},g=`shadowsFragmentFunctions`,_=`#ifdef SHADOWS
+`;e.IncludesShadersStoreWGSL[u]||(e.IncludesShadersStoreWGSL[u]=d);var f={name:u,shader:d},p=`shadowsFragmentFunctions`,m=`#ifdef SHADOWS
 #ifndef SHADOWFLOAT
 fn unpack(color: vec4f)->f32
 {const bit_shift: vec4f= vec4f(1.0/(255.0*255.0*255.0),1.0/(255.0*255.0),1.0/255.0,1.0);return dot(color,bit_shift);}
@@ -442,7 +365,7 @@ fn computeShadowWithCSMPCSS32(layer: i32,vPositionFromLight: vec4f,depthMetric: 
 fn computeShadowWithCSMPCSS64(layer: i32,vPositionFromLight: vec4f,depthMetric: f32,depthTexture: texture_2d_array<f32>,depthSampler: sampler,shadowTexture: texture_depth_2d_array,shadowSampler: sampler_comparison,shadowMapSizeInverse: f32,lightSizeUV: f32,darkness: f32,frustumEdgeFalloff: f32,lightSizeUVCorrection: vec2f,depthCorrection: f32,penumbraDarkness: f32)->f32
 {return computeShadowWithCSMPCSS(layer,vPositionFromLight,depthMetric,depthTexture,depthSampler,shadowTexture,shadowSampler,shadowMapSizeInverse,lightSizeUV,darkness,frustumEdgeFalloff,32,64,PoissonSamplers64,lightSizeUVCorrection,depthCorrection,penumbraDarkness);}
 #endif
-`;e.IncludesShadersStoreWGSL[g]||(e.IncludesShadersStoreWGSL[g]=_);var v={name:g,shader:_},y=`imageProcessingDeclaration`,b=`#ifdef EXPOSURE
+`;e.IncludesShadersStoreWGSL[p]||(e.IncludesShadersStoreWGSL[p]=m);var h={name:p,shader:m},g=`imageProcessingDeclaration`,_=`#ifdef EXPOSURE
 uniform exposureLinear: f32;
 #endif
 #ifdef CONTRAST
@@ -468,7 +391,7 @@ uniform colorTransformSettings: vec4f;
 #ifdef DITHER
 uniform ditherIntensity: f32;
 #endif
-`;e.IncludesShadersStoreWGSL[y]||(e.IncludesShadersStoreWGSL[y]=b);var x={name:y,shader:b},S=`imageProcessingFunctions`,C=`#if TONEMAPPING==3
+`;e.IncludesShadersStoreWGSL[g]||(e.IncludesShadersStoreWGSL[g]=_);var v={name:g,shader:_},y=`imageProcessingFunctions`,b=`#if TONEMAPPING==3
 const PBRNeutralStartCompression: f32=0.8-0.04;const PBRNeutralDesaturation: f32=0.15;fn PBRNeutralToneMapping( color: vec3f )->vec3f {var x: f32=min(color.r,min(color.g,color.b));var offset: f32=select(0.04,x-6.25*x*x,x<0.08);var result=color;result-=offset;var peak: f32=max(result.r,max(result.g,result.b));if (peak<PBRNeutralStartCompression) {return result;}
 var d: f32=1.-PBRNeutralStartCompression;var newPeak: f32=1.-d*d/(peak+d-PBRNeutralStartCompression);result*=newPeak/peak;var g: f32=1.-1./(PBRNeutralDesaturation*(peak-newPeak)+1.);return mix(result,newPeak* vec3f(1,1,1),g);}
 #endif
@@ -530,7 +453,7 @@ var luma: f32=getLuminance(rgb);var curveMix: vec2f=clamp( vec2f(luma*3.0-1.5,lu
 var rand: f32=getRand(fragmentInputs.position.xy*uniforms.vInverseScreenSize);var dither: f32=mix(-uniforms.ditherIntensity,uniforms.ditherIntensity,rand);rgb=saturateVec3(rgb+ vec3f(dither));
 #endif
 #define CUSTOM_IMAGEPROCESSINGFUNCTIONS_UPDATERESULT_ATEND
-return vec4f(rgb,result.a);}`;e.IncludesShadersStoreWGSL[S]||(e.IncludesShadersStoreWGSL[S]=C);var w={name:S,shader:C},T=`textureRepetitionFunctions`,E=`#if TEXTURE_REPETITION_MODE>0
+return vec4f(rgb,result.a);}`;e.IncludesShadersStoreWGSL[y]||(e.IncludesShadersStoreWGSL[y]=b);var x={name:y,shader:b},S=`textureRepetitionFunctions`,C=`#if TEXTURE_REPETITION_MODE>0
 fn _texRepHash4(p: vec2f)->vec4f {return fract(sin(vec4f(
 1.0+dot(p,vec2f(37.0,17.0)),
 2.0+dot(p,vec2f(11.0,47.0)),
@@ -571,16 +494,16 @@ fn TEXRD(t: texture_2d<f32>,ts: sampler,uv: vec2f)->vec4f {return _texRepSample(
 fn TEXRD(t: texture_2d<f32>,ts: sampler,uv: vec2f)->vec4f {return textureSample(t,ts,uv);}
 #endif
 #define TEXRD_DEFINED
-`;e.IncludesShadersStoreWGSL[T]||(e.IncludesShadersStoreWGSL[T]=E);var D={name:T,shader:E},O=`depthPrePass`,k=`#ifdef DEPTHPREPASS
+`;e.IncludesShadersStoreWGSL[S]||(e.IncludesShadersStoreWGSL[S]=C);var w={name:S,shader:C},T=`depthPrePass`,E=`#ifdef DEPTHPREPASS
 #if !defined(PREPASS) && !defined(ORDER_INDEPENDENT_TRANSPARENCY)
 fragmentOutputs.color= vec4f(0.,0.,0.,1.0);
 #endif
 return fragmentOutputs;
 #endif
-`;e.IncludesShadersStoreWGSL[O]||(e.IncludesShadersStoreWGSL[O]=k);var A={name:O,shader:k},j=`logDepthFragment`,M=`#ifdef LOGARITHMICDEPTH
+`;e.IncludesShadersStoreWGSL[T]||(e.IncludesShadersStoreWGSL[T]=E);var D={name:T,shader:E},O=`logDepthFragment`,k=`#ifdef LOGARITHMICDEPTH
 fragmentOutputs.fragDepth=log2(fragmentInputs.vFragmentDepth)*uniforms.logarithmicDepthConstant*0.5;
 #endif
-`;e.IncludesShadersStoreWGSL[j]||(e.IncludesShadersStoreWGSL[j]=M);var N={name:j,shader:M},P=`oitFragment`,F=`#ifdef ORDER_INDEPENDENT_TRANSPARENCY
+`;e.IncludesShadersStoreWGSL[O]||(e.IncludesShadersStoreWGSL[O]=k);var A={name:O,shader:k},j=`oitFragment`,M=`#ifdef ORDER_INDEPENDENT_TRANSPARENCY
 var fragDepth: f32=fragmentInputs.position.z; 
 #ifdef ORDER_INDEPENDENT_TRANSPARENCY_16BITS
 var halfFloat: u32=pack2x16float( vec2f(fragDepth));var full: vec2f=unpack2x16float(halfFloat);fragDepth=full.x;
@@ -605,4 +528,4 @@ if (fragDepth>nearestDepth && fragDepth<furthestDepth) {
 #endif
 fragmentOutputs.depth=vec2f(-fragDepth,fragDepth);return fragmentOutputs;}
 #endif
-`;e.IncludesShadersStoreWGSL[P]||(e.IncludesShadersStoreWGSL[P]=F);var I={name:P,shader:F};export{w as a,h as c,o as d,r as f,D as i,f as l,N as n,x as o,A as r,v as s,I as t,l as u};
+`;e.IncludesShadersStoreWGSL[j]||(e.IncludesShadersStoreWGSL[j]=M);var N={name:j,shader:M};export{x as a,f as c,r as d,w as i,l,A as n,v as o,D as r,h as s,N as t,o as u};

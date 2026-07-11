@@ -5,9 +5,10 @@ import type { Light } from '@babylonjs/core/Lights/light'
 import { ComputeShader } from '@babylonjs/core/Compute/computeShader'
 import { Constants } from '@babylonjs/core/Engines/constants'
 import { DirectionalLight } from '@babylonjs/core/Lights/directionalLight'
-import { HemisphericLight } from '@babylonjs/core/Lights/hemisphericLight'
 import { Material } from '@babylonjs/core/Materials/material'
 import { PointLight } from '@babylonjs/core/Lights/pointLight'
+import { RectAreaLight } from '@babylonjs/core/Lights/rectAreaLight'
+import { SpotLight } from '@babylonjs/core/Lights/spotLight'
 import { StorageBuffer } from '@babylonjs/core/Buffers/storageBuffer'
 import { VertexBuffer } from '@babylonjs/core/Buffers/buffer'
 import { Vector3 } from '@babylonjs/core/Maths/math.vector'
@@ -52,7 +53,7 @@ export type WebGPUBakeResult = {
 }
 
 const MAX_LIGHTS = 8
-const LIGHT_STRIDE_FLOATS = 16
+const LIGHT_STRIDE_FLOATS = 32
 const WEBGPU_BAKE_PROBE_STRIDE_FLOATS = 20
 const TRIANGLE_STRIDE_FLOATS = 16
 const BVH_NODE_STRIDE_FLOATS = 12
@@ -617,6 +618,11 @@ const denoiseIvolPayload = (resolution: Vec3Tuple, payload: Float32Array): Float
         const centerVisibility = payload[base + 13]
         const centerProximity = payload[base + 14]
         const centerRelocation = payload[base + 18]
+        const centerLightingMagnitude = shL0Magnitude(payload, base)
+        const centerDirectionX = luminance(payload[base + 3], payload[base + 4], payload[base + 5])
+        const centerDirectionY = luminance(payload[base + 6], payload[base + 7], payload[base + 8])
+        const centerDirectionZ = luminance(payload[base + 9], payload[base + 10], payload[base + 11])
+        const centerDirectionMagnitude = Math.hypot(centerDirectionX, centerDirectionY, centerDirectionZ)
         const sums = new Float32Array(12)
         let weightSum = 1
 
@@ -638,8 +644,24 @@ const denoiseIvolPayload = (resolution: Vec3Tuple, payload: Float32Array): Float
           const proximityDelta = Math.abs(centerProximity - payload[neighborBase + 14])
           const relocationDelta = Math.abs(centerRelocation - payload[neighborBase + 18])
           const edgeWeight = Math.max(0, 1 - visibilityDelta * 1.8 - proximityDelta * 1.4 - relocationDelta * 0.9)
+          const neighborLightingMagnitude = shL0Magnitude(payload, neighborBase)
+          const lightingDelta = shL0Distance(payload, base, neighborBase) /
+            Math.max(centerLightingMagnitude, neighborLightingMagnitude, 0.025)
+          // Preserve sampled lighting gradients without freezing the filter at
+          // a Spotlight penumbra. A moderate bilateral coefficient still
+          // rejects true discontinuities while allowing neighboring cone
+          // samples to reconstruct Babylon's authored soft transition.
+          const lightingEdgeWeight = 1 / (1 + lightingDelta * lightingDelta * 6)
+          const directionEdgeWeight = dominantDirectionEdgeWeight(
+            payload,
+            neighborBase,
+            centerDirectionX,
+            centerDirectionY,
+            centerDirectionZ,
+            centerDirectionMagnitude,
+          )
           const neighborTrust = Math.max(0.08, payload[neighborBase + 13] * payload[neighborBase + 14])
-          const weight = 0.28 * edgeWeight * neighborTrust
+          const weight = 0.28 * edgeWeight * lightingEdgeWeight * directionEdgeWeight * neighborTrust
 
           if (weight <= 0.0001) {
             continue
@@ -659,6 +681,43 @@ const denoiseIvolPayload = (resolution: Vec3Tuple, payload: Float32Array): Float
   }
 
   return output
+}
+
+const shL0Magnitude = (payload: Float32Array, base: number): number => Math.hypot(
+  payload[base],
+  payload[base + 1],
+  payload[base + 2],
+)
+
+const shL0Distance = (payload: Float32Array, firstBase: number, secondBase: number): number => Math.hypot(
+  payload[firstBase] - payload[secondBase],
+  payload[firstBase + 1] - payload[secondBase + 1],
+  payload[firstBase + 2] - payload[secondBase + 2],
+)
+
+const dominantDirectionEdgeWeight = (
+  payload: Float32Array,
+  neighborBase: number,
+  centerX: number,
+  centerY: number,
+  centerZ: number,
+  centerMagnitude: number,
+): number => {
+  const neighborX = luminance(payload[neighborBase + 3], payload[neighborBase + 4], payload[neighborBase + 5])
+  const neighborY = luminance(payload[neighborBase + 6], payload[neighborBase + 7], payload[neighborBase + 8])
+  const neighborZ = luminance(payload[neighborBase + 9], payload[neighborBase + 10], payload[neighborBase + 11])
+  const neighborMagnitude = Math.hypot(neighborX, neighborY, neighborZ)
+  if (centerMagnitude <= 0.0001 || neighborMagnitude <= 0.0001) {
+    return 1
+  }
+
+  const similarity = Math.max(
+    0,
+    (centerX * neighborX + centerY * neighborY + centerZ * neighborZ) /
+      (centerMagnitude * neighborMagnitude),
+  )
+
+  return 0.2 + similarity * 0.8
 }
 
 const constrainIvolPayloadSh = (payload: Float32Array): Float32Array => {
@@ -1200,48 +1259,117 @@ const createLightBuffer = (lights: Light[]): Float32Array => {
   for (let index = 0; index < packedLights.length; index += 1) {
     const light = packedLights[index]
     const base = index * LIGHT_STRIDE_FLOATS
+    const metadata = getIvolLightMetadata(light)
+    const position = readMetadataVector(metadata.ivolPosition, getLightPosition(light))
+    const direction = readMetadataVector(metadata.ivolDirection, getLightDirection(light))
+    const right = readMetadataVector(metadata.ivolRight, Vector3.Right())
+    const up = readMetadataVector(metadata.ivolUp, Vector3.Up())
     data[base] = light.getTypeID()
-    data[base + 1] = light.intensity
-    data[base + 2] = 'range' in light ? Number(light.range) || 0 : 0
+    data[base + 1] = light instanceof RectAreaLight ? light.intensity : light.getScaledIntensity()
+    data[base + 2] = readMetadataNumber(
+      metadata.ivolRange,
+      'range' in light ? Number(light.range) || 0 : 0,
+    )
     data[base + 3] = light.isEnabled() ? 1 : 0
-    data[base + 7] = readIvolSourceRadius(light)
-
-    if (light instanceof DirectionalLight) {
-      const directionToLight = light.direction.scale(-1).normalize()
-      data[base + 4] = directionToLight.x
-      data[base + 5] = directionToLight.y
-      data[base + 6] = directionToLight.z
-    } else if (light instanceof PointLight) {
-      data[base + 4] = light.position.x
-      data[base + 5] = light.position.y
-      data[base + 6] = light.position.z
-    } else if (light instanceof HemisphericLight) {
-      const direction = light.direction.normalizeToNew()
-      data[base + 4] = direction.x
-      data[base + 5] = direction.y
-      data[base + 6] = direction.z
-    } else {
-      const up = Vector3.Up()
-      data[base + 4] = up.x
-      data[base + 5] = up.y
-      data[base + 6] = up.z
-    }
+    data[base + 4] = position.x
+    data[base + 5] = position.y
+    data[base + 6] = position.z
+    data[base + 7] = readMetadataNumber(metadata.ivolSourceRadius, readLightRadius(light))
 
     data[base + 8] = light.diffuse.r
     data[base + 9] = light.diffuse.g
     data[base + 10] = light.diffuse.b
+    data[base + 11] = readMetadataNumber(metadata.ivolInnerConeCos, 1)
+    data[base + 12] = readMetadataNumber(metadata.ivolOuterConeCos, -1)
+    data[base + 13] = direction.x
+    data[base + 14] = direction.y
+    data[base + 15] = direction.z
+    data[base + 16] = right.x
+    data[base + 17] = right.y
+    data[base + 18] = right.z
+    data[base + 19] = readMetadataNumber(
+      metadata.ivolWidth,
+      light instanceof RectAreaLight ? light.width : 0,
+    )
+    data[base + 20] = up.x
+    data[base + 21] = up.y
+    data[base + 22] = up.z
+    data[base + 23] = readMetadataNumber(
+      metadata.ivolHeight,
+      light instanceof RectAreaLight ? light.height : 0,
+    )
+    data[base + 24] = readMetadataNumber(metadata.ivolAngularRadius, readLightAngularRadius(light))
   }
 
   return data
 }
 
-const readIvolSourceRadius = (light: Light): number => {
+type IvolLightMetadata = {
+  ivolPosition?: unknown
+  ivolDirection?: unknown
+  ivolRight?: unknown
+  ivolUp?: unknown
+  ivolSourceRadius?: unknown
+  ivolAngularRadius?: unknown
+  ivolRange?: unknown
+  ivolInnerConeCos?: unknown
+  ivolOuterConeCos?: unknown
+  ivolWidth?: unknown
+  ivolHeight?: unknown
+}
+
+const getIvolLightMetadata = (light: Light): IvolLightMetadata => {
   const metadata = light.metadata
 
-  if (metadata && typeof metadata === 'object' && 'ivolSourceRadius' in metadata) {
-    const radius = Number((metadata as { ivolSourceRadius?: unknown }).ivolSourceRadius)
+  return metadata && typeof metadata === 'object' ? metadata as IvolLightMetadata : {}
+}
 
-    return Number.isFinite(radius) ? Math.max(0, radius) : 0
+const readMetadataNumber = (value: unknown, fallback: number): number => {
+  const numericValue = Number(value)
+
+  return Number.isFinite(numericValue) ? numericValue : fallback
+}
+
+const readMetadataVector = (value: unknown, fallback: Vector3): Vector3 => {
+  if (Array.isArray(value) && value.length >= 3) {
+    const x = Number(value[0])
+    const y = Number(value[1])
+    const z = Number(value[2])
+    if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {
+      return new Vector3(x, y, z)
+    }
+  }
+
+  return fallback
+}
+
+const getLightPosition = (light: Light): Vector3 => {
+  if (light instanceof PointLight || light instanceof SpotLight || light instanceof RectAreaLight) {
+    return light.position.clone()
+  }
+
+  return Vector3.Zero()
+}
+
+const getLightDirection = (light: Light): Vector3 => {
+  if (light instanceof DirectionalLight || light instanceof SpotLight) {
+    return light.direction.normalizeToNew()
+  }
+
+  return Vector3.Backward()
+}
+
+const readLightRadius = (light: Light): number => {
+  if (light instanceof PointLight || light instanceof SpotLight) {
+    return Math.max(0, light.radius)
+  }
+
+  return 0
+}
+
+const readLightAngularRadius = (light: Light): number => {
+  if (light instanceof DirectionalLight) {
+    return Math.max(0, light.radius)
   }
 
   return 0
@@ -1254,7 +1382,7 @@ const WEBGPU_BAKE_SHADER = /* wgsl */ `
 @group(0) @binding(3) var<storage, read> triangles : array<f32>;
 @group(0) @binding(4) var<storage, read> bvhNodes : array<f32>;
 
-const LIGHT_STRIDE : u32 = 16u;
+const LIGHT_STRIDE : u32 = 32u;
 const PROBE_STRIDE : u32 = 20u;
 const TRIANGLE_STRIDE : u32 = 16u;
 const BVH_NODE_STRIDE : u32 = 12u;
@@ -1279,9 +1407,11 @@ struct TriangleHit {
 };
 
 struct LightContribution {
-  irradiance: vec3<f32>,
+  sh0: vec3<f32>,
+  sh1: vec3<f32>,
+  sh2: vec3<f32>,
+  sh3: vec3<f32>,
   dominantIntensity: f32,
-  directionToLight: vec3<f32>,
 };
 
 struct RelocatedProbe {
@@ -1301,6 +1431,27 @@ fn safeNormalize(value: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
   }
 
   return value * inverseSqrt(lengthSquared);
+}
+
+fn zeroLightContribution() -> LightContribution {
+  return LightContribution(
+    vec3<f32>(0.0),
+    vec3<f32>(0.0),
+    vec3<f32>(0.0),
+    vec3<f32>(0.0),
+    0.0,
+  );
+}
+
+fn directionalLightContribution(irradiance: vec3<f32>, directionToLight: vec3<f32>) -> LightContribution {
+  let direction = safeNormalize(directionToLight, vec3<f32>(0.0, 1.0, 0.0));
+  return LightContribution(
+    irradiance,
+    irradiance * direction.x,
+    irradiance * direction.y,
+    irradiance * direction.z,
+    length(irradiance),
+  );
 }
 
 fn safeInverse(value: f32) -> f32 {
@@ -1545,31 +1696,146 @@ fn areaLightSamplePosition(center: vec3<f32>, sourceRadius: f32, sampleIndex: u3
   return center + offset;
 }
 
+fn directionalLightSampleDirection(
+  centerDirection: vec3<f32>,
+  angularRadius: f32,
+  sampleIndex: u32,
+  sampleCount: u32,
+  seed: u32,
+) -> vec3<f32> {
+  let center = safeNormalize(centerDirection, vec3<f32>(0.0, 1.0, 0.0));
+  if (angularRadius <= 0.00001 || sampleCount <= 1u) {
+    return center;
+  }
+
+  let sample = f32(sampleIndex) + 0.5;
+  let count = max(f32(sampleCount), 1.0);
+  let radius = sqrt(sample / count) * min(angularRadius, PI * 0.5);
+  let phi = GOLDEN_ANGLE * (sample + f32(seed & 1023u) * 0.037);
+  let helper = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(center.y) > 0.92);
+  let tangent = safeNormalize(cross(helper, center), vec3<f32>(1.0, 0.0, 0.0));
+  let bitangent = cross(center, tangent);
+
+  return safeNormalize(
+    center * cos(radius) + (tangent * cos(phi) + bitangent * sin(phi)) * sin(radius),
+    center,
+  );
+}
+
+fn rectangularLightSamplePosition(
+  center: vec3<f32>,
+  right: vec3<f32>,
+  up: vec3<f32>,
+  width: f32,
+  height: f32,
+  sampleIndex: u32,
+  sampleCount: u32,
+  seed: u32,
+) -> vec3<f32> {
+  if (sampleCount <= 1u) {
+    return center;
+  }
+
+  let sample = f32(sampleIndex) + 0.5;
+  let seedOffset = f32(seed & 1023u) * 0.0009775171;
+  let u = fract(sample / f32(sampleCount) + seedOffset) - 0.5;
+  let v = fract(sample * 0.61803398875 + seedOffset * 1.61803398875) - 0.5;
+
+  return center
+    + safeNormalize(right, vec3<f32>(1.0, 0.0, 0.0)) * (u * width)
+    + safeNormalize(up, vec3<f32>(0.0, 1.0, 0.0)) * (v * height);
+}
+
+fn rangeAttenuation(distance: f32, range: f32) -> f32 {
+  let safeRange = max(range, 0.001);
+  let normalizedDistance = distance / safeRange;
+  let attenuation = saturate(1.0 - normalizedDistance * normalizedDistance);
+
+  return attenuation * attenuation;
+}
+
+fn gltfRangeAttenuation(distance: f32, range: f32) -> f32 {
+  let safeRange = max(range, 0.001);
+  let factor = distance * distance / (safeRange * safeRange);
+  let attenuation = saturate(1.0 - factor * factor);
+
+  return attenuation * attenuation;
+}
+
+fn spotConeAttenuation(
+  directionToLightValue: vec3<f32>,
+  emissionDirection: vec3<f32>,
+  innerConeCos: f32,
+  outerConeCos: f32,
+) -> f32 {
+  let fromLightToReceiver = -safeNormalize(directionToLightValue, vec3<f32>(0.0, 0.0, 1.0));
+  let coneCos = dot(fromLightToReceiver, safeNormalize(emissionDirection, vec3<f32>(0.0, 0.0, -1.0)));
+  let coneRange = max(innerConeCos - outerConeCos, 0.001);
+  let cone = saturate((coneCos - outerConeCos) / coneRange);
+
+  // Match Babylon's LIGHT_FALLOFF_GLTF path exactly: normalize linearly
+  // between the outer and inner cone cosines, then square the result.
+  return cone * cone;
+}
+
 fn lightContribution(lightIndex: u32, position: vec3<f32>, sampleSeed: u32) -> LightContribution {
   let base = lightIndex * LIGHT_STRIDE;
   let lightType = u32(lights[base]);
   let intensity = lights[base + 1u];
   let range = lights[base + 2u];
   let enabled = lights[base + 3u];
-  let vector = vec3<f32>(lights[base + 4u], lights[base + 5u], lights[base + 6u]);
+  let lightPosition = vec3<f32>(lights[base + 4u], lights[base + 5u], lights[base + 6u]);
   let sourceRadius = max(lights[base + 7u], 0.0);
   let color = vec3<f32>(lights[base + 8u], lights[base + 9u], lights[base + 10u]);
+  let innerConeCos = lights[base + 11u];
+  let outerConeCos = lights[base + 12u];
+  let emissionDirection = safeNormalize(
+    vec3<f32>(lights[base + 13u], lights[base + 14u], lights[base + 15u]),
+    vec3<f32>(0.0, 0.0, -1.0),
+  );
+  let areaRight = vec3<f32>(lights[base + 16u], lights[base + 17u], lights[base + 18u]);
+  let areaWidth = max(lights[base + 19u], 0.001);
+  let areaUp = vec3<f32>(lights[base + 20u], lights[base + 21u], lights[base + 22u]);
+  let areaHeight = max(lights[base + 23u], 0.001);
+  let angularRadius = max(lights[base + 24u], 0.0);
 
   if (enabled < 0.5) {
-    return LightContribution(vec3<f32>(0.0), 0.0, vec3<f32>(0.0, 1.0, 0.0));
+    return zeroLightContribution();
   }
 
   if (lightType == 1u) {
-    let directionToLight = normalize(vector);
-    if (rayOccluded(position + directionToLight * SHADOW_EPSILON, directionToLight, params[16])) {
-      return LightContribution(vec3<f32>(0.0), 0.0, directionToLight);
+    let centerDirectionToLight = -emissionDirection;
+    let sampleCount = areaLightSampleCount(angularRadius);
+    var irradiance = vec3<f32>(0.0);
+    var weightedDirection = vec3<f32>(0.0);
+
+    for (var sample = 0u; sample < MAX_AREA_LIGHT_SAMPLE_COUNT; sample = sample + 1u) {
+      if (sample >= sampleCount) {
+        break;
+      }
+
+      let sampleDirection = directionalLightSampleDirection(
+        centerDirectionToLight,
+        angularRadius,
+        sample,
+        sampleCount,
+        lightIndex + sampleSeed * 113u,
+      );
+      if (!rayOccluded(position + sampleDirection * SHADOW_EPSILON, sampleDirection, params[16])) {
+        let sampleIrradiance = color * intensity * INV_PI;
+        irradiance = irradiance + sampleIrradiance;
+        weightedDirection = weightedDirection + sampleDirection * length(sampleIrradiance);
+      }
     }
-    let skylikeVisibility = saturate(directionToLight.y * 0.5 + 0.5);
-    let irradiance = color * intensity * 0.000018 * skylikeVisibility;
-    return LightContribution(irradiance, length(irradiance), directionToLight);
+
+    irradiance = irradiance / f32(sampleCount);
+    return directionalLightContribution(
+      irradiance,
+      safeNormalize(weightedDirection, centerDirectionToLight),
+    );
   }
 
-  if (lightType == 0u) {
+  if (lightType == 0u || lightType == 2u) {
     let sampleCount = areaLightSampleCount(sourceRadius);
     var irradiance = vec3<f32>(0.0);
     var weightedDirection = vec3<f32>(0.0);
@@ -1579,36 +1845,83 @@ fn lightContribution(lightIndex: u32, position: vec3<f32>, sampleSeed: u32) -> L
         break;
       }
 
-      let samplePosition = areaLightSamplePosition(vector, sourceRadius, sample, sampleCount, lightIndex + sampleSeed * 131u);
+      let samplePosition = areaLightSamplePosition(lightPosition, sourceRadius, sample, sampleCount, lightIndex + sampleSeed * 131u);
       let delta = samplePosition - position;
       let distanceSquared = max(dot(delta, delta), 0.08);
       let distance = sqrt(distanceSquared);
       let lightDirection = directionToLight(delta);
-      let safeRange = max(range, 0.001);
-      let normalizedDistance = distance / safeRange;
-      let rangeAttenuation = saturate(1.0 - normalizedDistance * normalizedDistance);
-      if (rangeAttenuation > 0.0 && !rayOccluded(position + lightDirection * SHADOW_EPSILON, lightDirection, distance - SHADOW_EPSILON * 2.0)) {
+      let distanceAttenuation = select(
+        rangeAttenuation(distance, range),
+        gltfRangeAttenuation(distance, range),
+        lightType == 2u,
+      );
+      let coneAttenuation = select(
+        1.0,
+        spotConeAttenuation(lightDirection, emissionDirection, innerConeCos, outerConeCos),
+        lightType == 2u,
+      );
+      if (
+        distanceAttenuation > 0.0 &&
+        coneAttenuation > 0.0 &&
+        !rayOccluded(position + lightDirection * SHADOW_EPSILON, lightDirection, distance - SHADOW_EPSILON * 2.0)
+      ) {
         // Point-light intensity is authored in candela. Convert illuminance I/r^2
         // to Lambertian outgoing radiance E/pi before projecting it into L1 SH.
-        let sampleIrradiance = color * intensity * INV_PI / distanceSquared * rangeAttenuation * rangeAttenuation;
+        let sampleIrradiance = color * intensity * INV_PI / distanceSquared * distanceAttenuation * coneAttenuation;
         irradiance = irradiance + sampleIrradiance;
         weightedDirection = weightedDirection + lightDirection * length(sampleIrradiance);
       }
     }
 
     irradiance = irradiance / f32(sampleCount);
-    let fallbackDirection = directionToLight(vector - position);
-    return LightContribution(irradiance, length(irradiance), safeNormalize(weightedDirection, fallbackDirection));
+    let fallbackDirection = directionToLight(lightPosition - position);
+    return directionalLightContribution(irradiance, safeNormalize(weightedDirection, fallbackDirection));
   }
 
-  if (lightType == 3u) {
-    let up = normalize(vector);
-    let hemisphere = saturate(up.y * 0.5 + 0.5);
-    let irradiance = color * intensity * 0.08 * hemisphere;
-    return LightContribution(irradiance, length(irradiance), up);
+  if (lightType == 4u) {
+    let sampleCount = min(max(u32(params[19]), 1u), MAX_AREA_LIGHT_SAMPLE_COUNT);
+    let area = areaWidth * areaHeight;
+    var irradiance = vec3<f32>(0.0);
+    var weightedDirection = vec3<f32>(0.0);
+
+    for (var sample = 0u; sample < MAX_AREA_LIGHT_SAMPLE_COUNT; sample = sample + 1u) {
+      if (sample >= sampleCount) {
+        break;
+      }
+
+      let samplePosition = rectangularLightSamplePosition(
+        lightPosition,
+        areaRight,
+        areaUp,
+        areaWidth,
+        areaHeight,
+        sample,
+        sampleCount,
+        lightIndex + sampleSeed * 149u,
+      );
+      let delta = samplePosition - position;
+      let distanceSquared = max(dot(delta, delta), 0.08);
+      let distance = sqrt(distanceSquared);
+      let lightDirection = directionToLight(delta);
+      let emitterTerm = saturate(dot(emissionDirection, -lightDirection));
+      if (
+        emitterTerm > 0.0 &&
+        !rayOccluded(position + lightDirection * SHADOW_EPSILON, lightDirection, distance - SHADOW_EPSILON * 2.0)
+      ) {
+        // Rect-area intensity is authored as luminance. Each stratified sample
+        // represents an equal portion of the emitting rectangle.
+        let sampleIrradiance = color * intensity * area * emitterTerm * INV_PI / distanceSquared;
+        irradiance = irradiance + sampleIrradiance;
+        weightedDirection = weightedDirection + lightDirection * length(sampleIrradiance);
+      }
+    }
+
+    irradiance = irradiance / f32(sampleCount);
+    let fallbackDirection = directionToLight(lightPosition - position);
+    return directionalLightContribution(irradiance, safeNormalize(weightedDirection, fallbackDirection));
   }
 
-  return LightContribution(vec3<f32>(0.0), 0.0, vec3<f32>(0.0, 1.0, 0.0));
+  return zeroLightContribution();
 }
 
 fn directionToLight(delta: vec3<f32>) -> vec3<f32> {
@@ -1621,15 +1934,26 @@ fn surfaceLightContribution(lightIndex: u32, position: vec3<f32>, normal: vec3<f
   let intensity = lights[base + 1u];
   let range = lights[base + 2u];
   let enabled = lights[base + 3u];
-  let vector = vec3<f32>(lights[base + 4u], lights[base + 5u], lights[base + 6u]);
+  let lightPosition = vec3<f32>(lights[base + 4u], lights[base + 5u], lights[base + 6u]);
   let sourceRadius = max(lights[base + 7u], 0.0);
   let color = vec3<f32>(lights[base + 8u], lights[base + 9u], lights[base + 10u]);
+  let innerConeCos = lights[base + 11u];
+  let outerConeCos = lights[base + 12u];
+  let emissionDirection = safeNormalize(
+    vec3<f32>(lights[base + 13u], lights[base + 14u], lights[base + 15u]),
+    vec3<f32>(0.0, 0.0, -1.0),
+  );
+  let areaRight = vec3<f32>(lights[base + 16u], lights[base + 17u], lights[base + 18u]);
+  let areaWidth = max(lights[base + 19u], 0.001);
+  let areaUp = vec3<f32>(lights[base + 20u], lights[base + 21u], lights[base + 22u]);
+  let areaHeight = max(lights[base + 23u], 0.001);
+  let angularRadius = max(lights[base + 24u], 0.0);
 
   if (enabled < 0.5) {
     return vec3<f32>(0.0);
   }
 
-  if (lightType == 0u) {
+  if (lightType == 0u || lightType == 2u) {
     let sampleCount = areaLightSampleCount(sourceRadius);
     var irradiance = vec3<f32>(0.0);
 
@@ -1638,22 +1962,30 @@ fn surfaceLightContribution(lightIndex: u32, position: vec3<f32>, normal: vec3<f
         break;
       }
 
-      let samplePosition = areaLightSamplePosition(vector, sourceRadius, sample, sampleCount, lightIndex + sampleSeed * 173u);
+      let samplePosition = areaLightSamplePosition(lightPosition, sourceRadius, sample, sampleCount, lightIndex + sampleSeed * 173u);
       let delta = samplePosition - position;
       let distanceSquared = max(dot(delta, delta), 0.08);
       let distance = sqrt(distanceSquared);
       let lightDirection = directionToLight(delta);
       let normalTerm = saturate(dot(normal, lightDirection));
-      let safeRange = max(range, 0.001);
-      let normalizedDistance = distance / safeRange;
-      let rangeAttenuation = saturate(1.0 - normalizedDistance * normalizedDistance);
+      let distanceAttenuation = select(
+        rangeAttenuation(distance, range),
+        gltfRangeAttenuation(distance, range),
+        lightType == 2u,
+      );
+      let coneAttenuation = select(
+        1.0,
+        spotConeAttenuation(lightDirection, emissionDirection, innerConeCos, outerConeCos),
+        lightType == 2u,
+      );
 
       if (
         normalTerm > 0.0 &&
-        rangeAttenuation > 0.0 &&
+        distanceAttenuation > 0.0 &&
+        coneAttenuation > 0.0 &&
         !rayOccluded(position + normal * SHADOW_EPSILON, lightDirection, distance - SHADOW_EPSILON * 2.0)
       ) {
-        irradiance = irradiance + color * intensity * INV_PI / distanceSquared * rangeAttenuation * rangeAttenuation * normalTerm;
+        irradiance = irradiance + color * intensity * INV_PI / distanceSquared * distanceAttenuation * coneAttenuation * normalTerm;
       }
     }
 
@@ -1661,13 +1993,71 @@ fn surfaceLightContribution(lightIndex: u32, position: vec3<f32>, normal: vec3<f
   }
 
   if (lightType == 1u) {
-    let lightDirection = normalize(vector);
-    let normalTerm = saturate(dot(normal, lightDirection));
-    if (normalTerm <= 0.0 || rayOccluded(position + normal * SHADOW_EPSILON, lightDirection, params[16])) {
-      return vec3<f32>(0.0);
+    let centerDirectionToLight = -emissionDirection;
+    let sampleCount = areaLightSampleCount(angularRadius);
+    var irradiance = vec3<f32>(0.0);
+
+    for (var sample = 0u; sample < MAX_AREA_LIGHT_SAMPLE_COUNT; sample = sample + 1u) {
+      if (sample >= sampleCount) {
+        break;
+      }
+
+      let lightDirection = directionalLightSampleDirection(
+        centerDirectionToLight,
+        angularRadius,
+        sample,
+        sampleCount,
+        lightIndex + sampleSeed * 181u,
+      );
+      let normalTerm = saturate(dot(normal, lightDirection));
+      if (
+        normalTerm > 0.0 &&
+        !rayOccluded(position + normal * SHADOW_EPSILON, lightDirection, params[16])
+      ) {
+        irradiance = irradiance + color * intensity * INV_PI * normalTerm;
+      }
     }
 
-    return color * intensity * 0.000018 * normalTerm;
+    return irradiance / f32(sampleCount);
+  }
+
+  if (lightType == 4u) {
+    let sampleCount = min(max(u32(params[19]), 1u), MAX_AREA_LIGHT_SAMPLE_COUNT);
+    let area = areaWidth * areaHeight;
+    var irradiance = vec3<f32>(0.0);
+
+    for (var sample = 0u; sample < MAX_AREA_LIGHT_SAMPLE_COUNT; sample = sample + 1u) {
+      if (sample >= sampleCount) {
+        break;
+      }
+
+      let samplePosition = rectangularLightSamplePosition(
+        lightPosition,
+        areaRight,
+        areaUp,
+        areaWidth,
+        areaHeight,
+        sample,
+        sampleCount,
+        lightIndex + sampleSeed * 197u,
+      );
+      let delta = samplePosition - position;
+      let distanceSquared = max(dot(delta, delta), 0.08);
+      let distance = sqrt(distanceSquared);
+      let lightDirection = directionToLight(delta);
+      let normalTerm = saturate(dot(normal, lightDirection));
+      let emitterTerm = saturate(dot(emissionDirection, -lightDirection));
+      if (
+        normalTerm > 0.0 &&
+        emitterTerm > 0.0 &&
+        !rayOccluded(position + normal * SHADOW_EPSILON, lightDirection, distance - SHADOW_EPSILON * 2.0)
+      ) {
+        irradiance = irradiance
+          + color * intensity * area * emitterTerm * INV_PI / distanceSquared * normalTerm;
+      }
+    }
+
+    return irradiance / f32(sampleCount);
   }
 
   return vec3<f32>(0.0);
@@ -1912,11 +2302,10 @@ fn main(@builtin(global_invocation_id) globalId : vec3<u32>) {
 
   for (var i = 0u; i < lightCount; i = i + 1u) {
     let contribution = lightContribution(i, position, sampleSeed);
-    let basisA = shBasis4(contribution.directionToLight);
-    sh0 = sh0 + contribution.irradiance * basisA.x;
-    sh1 = sh1 + contribution.irradiance * basisA.y;
-    sh2 = sh2 + contribution.irradiance * basisA.z;
-    sh3 = sh3 + contribution.irradiance * basisA.w;
+    sh0 = sh0 + contribution.sh0;
+    sh1 = sh1 + contribution.sh1;
+    sh2 = sh2 + contribution.sh2;
+    sh3 = sh3 + contribution.sh3;
 
     if (contribution.dominantIntensity > dominantIntensity) {
       dominantIntensity = contribution.dominantIntensity;

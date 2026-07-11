@@ -18,38 +18,7 @@ uniform previousViewProjection: mat4x4f;varying vCurrentPosition: vec4f;varying 
 `;e.IncludesShadersStoreWGSL[i]||(e.IncludesShadersStoreWGSL[i]=a);var o={name:i,shader:a},s=`samplerVertexDeclaration`,c=`#if defined(_DEFINENAME_) && _DEFINENAME_DIRECTUV==0
 varying v_VARYINGNAME_UV: vec2f;
 #endif
-`;e.IncludesShadersStoreWGSL[s]||(e.IncludesShadersStoreWGSL[s]=c);var l={name:s,shader:c},u=`lightVxUboDeclaration`,d=`#ifdef LIGHT{X}
-struct Light{X}
-{vLightData: vec4f,
-vLightDiffuse: vec4f,
-vLightSpecular: vec4f,
-#ifdef SPOTLIGHT{X}
-vLightDirection: vec4f,
-vLightFalloff: vec4f,
-#elif defined(POINTLIGHT{X})
-vLightFalloff: vec4f,
-#elif defined(HEMILIGHT{X})
-vLightGround: vec3f,
-#elif defined(CLUSTLIGHT{X})
-vSliceData: vec2f,
-vSliceRanges: array<vec4f,CLUSTLIGHT_SLICES>,
-#endif
-#if defined(AREALIGHT{X}) && defined(AREALIGHTUSED) && defined(AREALIGHTSUPPORTED)
-vLightWidth: vec4f,
-vLightHeight: vec4f,
-#endif
-shadowsInfo: vec4f,
-depthValues: vec2f} ;var<uniform> light{X} : Light{X};
-#ifdef SHADOW{X}
-#ifdef SHADOWCSM{X}
-uniform lightMatrix{X}: array<mat4x4f,SHADOWCSMNUM_CASCADES{X}>;varying vPositionFromLight{X}_0: vec4f;varying vDepthMetric{X}_0: f32;varying vPositionFromLight{X}_1: vec4f;varying vDepthMetric{X}_1: f32;varying vPositionFromLight{X}_2: vec4f;varying vDepthMetric{X}_2: f32;varying vPositionFromLight{X}_3: vec4f;varying vDepthMetric{X}_3: f32;varying vPositionFromCamera{X}: vec4f;
-#elif defined(SHADOWCUBE{X})
-#else
-varying vPositionFromLight{X}: vec4f;varying vDepthMetric{X}: f32;uniform lightMatrix{X}: mat4x4f;
-#endif
-#endif
-#endif
-`;e.IncludesShadersStoreWGSL[u]||(e.IncludesShadersStoreWGSL[u]=d);var f={name:u,shader:d},p=`vertexPullingDeclaration`,m=`#ifdef USE_VERTEX_PULLING
+`;e.IncludesShadersStoreWGSL[s]||(e.IncludesShadersStoreWGSL[s]=c);var l={name:s,shader:c},u=`vertexPullingDeclaration`,d=`#ifdef USE_VERTEX_PULLING
 #ifdef VERTEX_PULLING_USE_INDEX_BUFFER
 var<storage,read> indices : array<u32>;
 #endif
@@ -227,7 +196,7 @@ vp_readMatrixWeightExtraValue(offset+cs*3u,dataType,normalized)
 #endif
 #endif
 #endif
-`;e.IncludesShadersStoreWGSL[p]||(e.IncludesShadersStoreWGSL[p]=m);var h={name:p,shader:m},g=`vertexPullingVertex`,_=`#ifdef USE_VERTEX_PULLING
+`;e.IncludesShadersStoreWGSL[u]||(e.IncludesShadersStoreWGSL[u]=d);var f={name:u,shader:d},p=`vertexPullingVertex`,m=`#ifdef USE_VERTEX_PULLING
 let vpVertexIndex: u32=vp_readVertexIndex(vertexInputs.vertexIndex);positionUpdated=vp_readPosition(uniforms.vp_position_info,vpVertexIndex);
 #ifdef NORMAL
 normalUpdated=vp_readNormal(uniforms.vp_normal_info,vpVertexIndex);
@@ -281,7 +250,7 @@ var vp_matricesIndicesExtra: vec4f=vp_readBoneIndicesExtra(uniforms.vp_matricesI
 #endif
 #endif
 #endif
-`;e.IncludesShadersStoreWGSL[g]||(e.IncludesShadersStoreWGSL[g]=_);var v={name:g,shader:_},y=`prePassVertex`,b=`#ifdef PREPASS_DEPTH
+`;e.IncludesShadersStoreWGSL[p]||(e.IncludesShadersStoreWGSL[p]=m);var h={name:p,shader:m},g=`prePassVertex`,_=`#ifdef PREPASS_DEPTH
 vertexOutputs.vViewPos=(scene.view*worldPos).rgb;
 #endif
 #ifdef PREPASS_NORMALIZED_VIEW_DEPTH
@@ -320,7 +289,7 @@ vertexOutputs.vPreviousPosition=uniforms.previousViewProjection*finalPreviousWor
 vertexOutputs.vPreviousPosition=uniforms.previousViewProjection*finalPreviousWorld* vec4f(positionUpdated,1.0);
 #endif
 #endif
-`;e.IncludesShadersStoreWGSL[y]||(e.IncludesShadersStoreWGSL[y]=b);var x={name:y,shader:b},S=`uvVariableDeclaration`,C=`#ifdef MAINUV{X}
+`;e.IncludesShadersStoreWGSL[g]||(e.IncludesShadersStoreWGSL[g]=_);var v={name:g,shader:_},y=`uvVariableDeclaration`,b=`#ifdef MAINUV{X}
 #if !defined(UV{X})
 var uv{X}: vec2f=vec2f(0.,0.);
 #elif defined(USE_VERTEX_PULLING)
@@ -330,7 +299,7 @@ var uv{X}: vec2f=vertexInputs.uv{X};
 #endif
 vertexOutputs.vMainUV{X}=uv{X};
 #endif
-`;e.IncludesShadersStoreWGSL[S]||(e.IncludesShadersStoreWGSL[S]=C);var w={name:S,shader:C},T=`samplerVertexImplementation`,E=`#if defined(_DEFINENAME_) && _DEFINENAME_DIRECTUV==0
+`;e.IncludesShadersStoreWGSL[y]||(e.IncludesShadersStoreWGSL[y]=b);var x={name:y,shader:b},S=`samplerVertexImplementation`,C=`#if defined(_DEFINENAME_) && _DEFINENAME_DIRECTUV==0
 if (uniforms.v_INFONAME_==0.)
 {vertexOutputs.v_VARYINGNAME_UV= (uniforms._MATRIXNAME_Matrix* vec4f(uvUpdated,1.0,0.0)).xy;}
 #ifdef UV2
@@ -354,7 +323,7 @@ else if (uniforms.v_INFONAME_==5.)
 {vertexOutputs.v_VARYINGNAME_UV= (uniforms._MATRIXNAME_Matrix* vec4f(vertexInputs.uv6,1.0,0.0)).xy;}
 #endif
 #endif
-`;e.IncludesShadersStoreWGSL[T]||(e.IncludesShadersStoreWGSL[T]=E);var D={name:T,shader:E},O=`shadowsVertex`,k=`#ifdef SHADOWS
+`;e.IncludesShadersStoreWGSL[S]||(e.IncludesShadersStoreWGSL[S]=C);var w={name:S,shader:C},T=`shadowsVertex`,E=`#ifdef SHADOWS
 #if defined(SHADOWCSM{X})
 #ifdef SCENE_UBO
 vertexOutputs.vPositionFromCamera{X}=scene.view*worldPos;
@@ -402,7 +371,7 @@ vertexOutputs.vDepthMetric{X}=(vertexOutputs.vPositionFromLight{X}.z+light{X}.de
 #endif
 #endif
 #endif
-`;e.IncludesShadersStoreWGSL[O]||(e.IncludesShadersStoreWGSL[O]=k);var A={name:O,shader:k},j=`logDepthVertex`,M=`#ifdef LOGARITHMICDEPTH
+`;e.IncludesShadersStoreWGSL[T]||(e.IncludesShadersStoreWGSL[T]=E);var D={name:T,shader:E},O=`logDepthVertex`,k=`#ifdef LOGARITHMICDEPTH
 vertexOutputs.vFragmentDepth=1.0+vertexOutputs.position.w;vertexOutputs.position.z=log2(max(0.000001,vertexOutputs.vFragmentDepth))*uniforms.logarithmicDepthConstant;
 #endif
-`;e.IncludesShadersStoreWGSL[j]||(e.IncludesShadersStoreWGSL[j]=M);var N={name:j,shader:M};export{x as a,f as c,r as d,w as i,l,A as n,v as o,D as r,h as s,N as t,o as u};
+`;e.IncludesShadersStoreWGSL[O]||(e.IncludesShadersStoreWGSL[O]=k);var A={name:O,shader:k};export{v as a,l as c,x as i,o as l,D as n,h as o,w as r,f as s,A as t,r as u};

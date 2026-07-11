@@ -1,12 +1,6 @@
-# Third-party notices
-
-## VRCLightVolumes
-
-This project derives its L1 spherical-harmonic texture packing, runtime lighting equations, and portions of its analytic area-light approach from [REDSIM/VRCLightVolumes](https://github.com/REDSIM/VRCLightVolumes).
-
 MIT License
 
-Copyright (c) 2025 RED_SIM
+Copyright (c) 2026 Babylon-LPV-Research contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

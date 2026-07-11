@@ -18,4 +18,4 @@ fragmentOutputs.color=uniforms.color;
 #endif
 #include<fogFragment>(color,fragmentOutputs.color)
 #define CUSTOM_FRAGMENT_MAIN_END
-}`;e.ShadersStoreWGSL[a]||(e.ShadersStoreWGSL[a]=o);var s=[t,r,n,i];for(let t of s)e.IncludesShadersStoreWGSL[t.name]||(e.IncludesShadersStoreWGSL[t.name]=t.shader);var c={name:a,shader:o};export{c as colorPixelShaderWGSL};
+}`;e.ShadersStoreWGSL[a]||(e.ShadersStoreWGSL[a]=o);var s=[t,r,n,i];for(let t of s)e.IncludesShadersStoreWGSL[t.name]||(e.IncludesShadersStoreWGSL[t.name]=t.shader);var c={name:a,shader:o};export{c as t};

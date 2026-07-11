@@ -29,4 +29,4 @@ var worldPos: vec4f=finalWorld* vec4f(vertexInputs.position,1.0);vertexOutputs.p
 #include<fogVertex>
 #include<vertexColorMixing>
 #define CUSTOM_VERTEX_MAIN_END
-}`;e.ShadersStoreWGSL[f]||(e.ShadersStoreWGSL[f]=p);var m=[o,i,t,l,d,n,a,r,s,c,u];for(let t of m)e.IncludesShadersStoreWGSL[t.name]||(e.IncludesShadersStoreWGSL[t.name]=t.shader);var h={name:f,shader:p};export{h as colorVertexShaderWGSL};
+}`;e.ShadersStoreWGSL[f]||(e.ShadersStoreWGSL[f]=p);var m=[o,i,t,l,d,n,a,r,s,c,u];for(let t of m)e.IncludesShadersStoreWGSL[t.name]||(e.IncludesShadersStoreWGSL[t.name]=t.shader);var h={name:f,shader:p};export{h as t};
